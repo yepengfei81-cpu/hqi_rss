@@ -1,39 +1,39 @@
-# 双臂倒水：π0.5 三种方法的训练与 rollout 代码
+# Bimanual pouring: training and rollout code for three π0.5 methods
 
-数据是 hqi 采的 50 条双臂倒水示教（MCAP）：右臂把水壶里的橙汁倒进玻璃杯，再把水壶放回。在这份数据上用同一组超参训练了三个模型：
+The data is hqi's 50 bimanual pouring demonstrations (MCAP). In each one, the right arm pours orange juice from a pitcher into a glass cup and then puts the pitcher back. We trained three models on this data with identical hyperparameters:
 
-| 方法 | 配置名 |
+| Method | Config name |
 |---|---|
 | baseline | `pi05_hqi_pour50` |
 | mask prompt + MCR | `pi05_hqi_pour50_mask` |
 | ControlVLA | `pi05_hqi_pour50_controlvla` |
 
-**怎么在机器人上跑，请看 [ROLLOUT_HQI.md](ROLLOUT_HQI.md)**：权重位置、输入输出约定、环境、离线自检、接自己的机器人，以及我们在 AIRBOT 上的 rollout 经验。
+**To run the models on a robot, see [ROLLOUT_HQI.md](ROLLOUT_HQI.md).** It covers where the weights are, the input/output contract, environment setup, the offline self-check, connecting your own robot, and what we learned doing rollouts on AIRBOT.
 
-## 仓库里有什么
+## What is in this repo
 
-| 路径 | 内容 |
+| Path | Contents |
 |---|---|
-| `rollout_hqi_pour.py` | 关节空间 rollout 脚本，和机器人无关：离线自检、真机骨架（`RealRobot`）、会话记录 |
-| `ROLLOUT_HQI.md` | rollout 说明 |
-| `airbot/hf_mask.py` | mask 生成器（Grounding DINO + SAM，按框面积分槽位）。训练 mask 和部署 mask 是同一个文件 |
-| `scripts/convert_hqi_mcap.py` | 原始 MCAP 转成 LeRobot 数据集（10 Hz） |
-| `scripts/gen_head_masks.py` | 生成训练 mask，命令见文件头 |
-| `scripts/compute_norm_stats.py`、`scripts/train.py`、`train_hqi_pour.sh` | 归一化统计量、训练入口、集群 sbatch 脚本 |
-| `src/openpi/` | 模型和训练代码，三个配置在 `src/openpi/training/config.py` 里搜 `pi05_hqi_pour50` |
-| `assets/` | 三个配置的归一化统计量（`norm_stats.json`，三份内容相同；checkpoint 里也各有一份） |
-| `reference/local_inference_eef.py` | 我们 AIRBOT 的 rollout 脚本，只供阅读，依赖的硬件代码不在这里 |
+| `rollout_hqi_pour.py` | Robot-agnostic joint-space rollout script: offline self-check, real-robot skeleton (`RealRobot`), session logging |
+| `ROLLOUT_HQI.md` | Rollout guide |
+| `airbot/hf_mask.py` | Mask generator (Grounding DINO + SAM, slots assigned by box area). Training masks and deployment masks come from this same file |
+| `scripts/convert_hqi_mcap.py` | Converts the raw MCAP files to a LeRobot dataset (10 Hz) |
+| `scripts/gen_head_masks.py` | Generates the training masks; the command is in the file header |
+| `scripts/compute_norm_stats.py`, `scripts/train.py`, `train_hqi_pour.sh` | Normalization statistics, training entry point, cluster sbatch script |
+| `src/openpi/` | Model and training code. The three configs are in `src/openpi/training/config.py` (search for `pi05_hqi_pour50`) |
+| `assets/` | Normalization statistics for the three configs (`norm_stats.json`; all three are identical, and each checkpoint also has its own copy) |
+| `reference/local_inference_eef.py` | Our AIRBOT rollout script, for reading only; the hardware code it depends on is not included |
 
-## 不在仓库里的东西（在集群上）
+## Not in this repo (on the cluster)
 
-集群目录 `P=/n/netscratch/hankyang_lab/Lab/pengfei`：
+Cluster directory: `P=/n/netscratch/hankyang_lab/Lab/pengfei`
 
-- 权重：`$P/openpi_hqi_pour/checkpoints/<配置名>/<实验名>/19999`，部署只需要其中的 `params/` 和 `assets/`。
-- 训练数据：`$P/pi_data/hqi_pour50`（LeRobot 格式）。
-- 训练 mask：`$P/pi_data/hqi_pour50_masks`。
+- Weights: `$P/openpi_hqi_pour/checkpoints/<config>/<exp>/19999`. Deployment needs only `params/` and `assets/`.
+- Training data: `$P/pi_data/hqi_pour50` (LeRobot format).
+- Training masks: `$P/pi_data/hqi_pour50_masks`.
 
-netscratch 有 90 天清理，请尽早拷走。
+netscratch purges files after 90 days, so please copy them off soon.
 
-## 来源
+## Origin
 
-代码基于 Physical Intelligence 的 [openpi](https://github.com/Physical-Intelligence/openpi)，许可证见 `LICENSE`（Apache-2.0）和 `LICENSE_GEMMA.txt`。ControlVLA 部分是 ybao 的 π0.5 近似实现。
+The code is based on Physical Intelligence's [openpi](https://github.com/Physical-Intelligence/openpi); see `LICENSE` (Apache-2.0) and `LICENSE_GEMMA.txt`. The ControlVLA part is ybao's approximate reimplementation on π0.5.

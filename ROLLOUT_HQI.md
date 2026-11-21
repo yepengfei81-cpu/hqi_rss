@@ -1,100 +1,100 @@
-# 倒水模型 rollout 说明
+# Rollout guide for the pouring models
 
-本文说明三个倒水模型怎么在你的机器人上跑，以及我们在 AIRBOT 上做 rollout 的方式。三个模型都在你发来的 50 条倒水数据上训练，配置分别是 baseline、mask、ControlVLA。代码就是本目录下的 `rollout_hqi_pour.py`，它和机器人无关，硬件部分要你自己接。
+This guide explains how to run the three pouring models on your robot, and how we do rollouts on AIRBOT. All three models were trained on the 50 pouring demonstrations you sent; the configs are baseline, mask and ControlVLA. The code is `rollout_hqi_pour.py` in this repo. It is robot-agnostic, so you need to connect your own hardware.
 
-建议按这个顺序来：
+Suggested order:
 
-1. 把权重、数据和代码拷到机器人电脑上，配好环境（第 3 节）。
-2. 不连机器人，先跑离线自检（第 4 节）。用一条示教数据当"机器人"喂给模型，确认模型输出合理、实时 mask 和训练 mask 一致。
-3. 在脚本里实现 `RealRobot` 的 5 个方法（第 5 节），先用 `--dry-run` 只推理不动，再真动。
+1. Copy the weights, data and code to the robot PC and set up the environment (Section 3).
+2. Without the robot, run the offline self-check (Section 4). It feeds one demonstration to the model as if it were the robot, to confirm the outputs are sensible and the live masks match the training masks.
+3. Implement the 5 methods of `RealRobot` in the script (Section 5). Run with `--dry-run` first (inference only, no motion), then for real.
 
 ---
 
-## 1. 权重和代码在哪
+## 1. Where the weights and code are
 
-权重和数据在集群上：`P=/n/netscratch/hankyang_lab/Lab/pengfei`，权重在 `$P/openpi_hqi_pour/checkpoints/` 下。这个仓库里的代码和集群上 `$P/openpi_hqi_pour` 的是同一份，三个模型就是用它训练的。
+The weights and data are on the cluster: `P=/n/netscratch/hankyang_lab/Lab/pengfei`, with the weights under `$P/openpi_hqi_pour/checkpoints/`. The code in this repo is the same as `$P/openpi_hqi_pour` on the cluster, which is what trained the three models.
 
-| 方法 | `--config-name` | 权重（20k 步的最终版） |
+| Method | `--config-name` | Weights (final, 20k steps) |
 |---|---|---|
 | baseline | `pi05_hqi_pour50` | `checkpoints/pi05_hqi_pour50/pour50_base_v1/19999` |
-| mask（你的 mask prompt + MCR） | `pi05_hqi_pour50_mask` | `checkpoints/pi05_hqi_pour50_mask/pour50_mask_v1/19999` |
+| mask (your mask prompt + MCR) | `pi05_hqi_pour50_mask` | `checkpoints/pi05_hqi_pour50_mask/pour50_mask_v1/19999` |
 | ControlVLA | `pi05_hqi_pour50_controlvla` | `checkpoints/pi05_hqi_pour50_controlvla/pour50_controlvla_v1/19999` |
 
-- 每个 `19999/` 下有三个子目录：`params/` 6.0 GB 是权重，`assets/` 里是归一化统计量，`train_state/` 3 GB 是优化器状态。部署只需要 `params/` 和 `assets/`，`train_state/` 不用拷。
-- 三个模型用同一份数据、同一组超参训练：π0.5，2 卡，batch 48，20k 步。它们只在 mask 方法上不同，训练 loss 基本重合。
-- netscratch 有 90 天清理，权重请尽早拷走。
+- Each `19999/` has three subdirectories: `params/` (6.0 GB) holds the weights, `assets/` the normalization statistics, and `train_state/` (3 GB) the optimizer state. Deployment needs only `params/` and `assets/`; you do not need to copy `train_state/`.
+- All three models were trained on the same data with the same hyperparameters: π0.5, 2 GPUs, batch 48, 20k steps. They differ only in the mask method, and their training losses nearly coincide.
+- netscratch purges files after 90 days, so please copy the weights off soon.
 
-相关代码：
+Related code:
 
-| 文件 | 内容 |
+| File | Contents |
 |---|---|
-| `rollout_hqi_pour.py` | 本文说的 rollout 脚本：离线自检、真机骨架、会话记录 |
-| `airbot/hf_mask.py` | mask 生成器。训练 mask 和部署 mask 是同一个文件 |
-| `scripts/gen_head_masks.py` | 训练 mask 的生成命令，见文件头 |
-| `src/openpi/policies/hqi_joint_policy.py` | 观测键到模型输入的映射 |
-| `src/openpi/training/config.py` | 搜 `pi05_hqi_pour50` 可以看到三个配置和 `LeRobotHqiJointDataConfig` |
-| `scripts/convert_hqi_mcap.py` | 你的 MCAP 怎么转成训练数据，包括 10 Hz 对齐方式 |
-| `train_hqi_pour.sh` | 集群上训练这三个模型用的 sbatch 脚本 |
-| `reference/local_inference_eef.py` | 我们 AIRBOT 自己的 rollout 脚本，只供阅读，见第 7 节 |
+| `rollout_hqi_pour.py` | The rollout script described here: offline self-check, real-robot skeleton, session logging |
+| `airbot/hf_mask.py` | Mask generator. Training masks and deployment masks come from this same file |
+| `scripts/gen_head_masks.py` | The command that generated the training masks, in the file header |
+| `src/openpi/policies/hqi_joint_policy.py` | Mapping from observation keys to model inputs |
+| `src/openpi/training/config.py` | Search for `pi05_hqi_pour50` to find the three configs and `LeRobotHqiJointDataConfig` |
+| `scripts/convert_hqi_mcap.py` | How your MCAP files were converted to training data, including the 10 Hz alignment |
+| `train_hqi_pour.sh` | The sbatch script used to train the three models on the cluster |
+| `reference/local_inference_eef.py` | Our own AIRBOT rollout script, for reading only; see Section 7 |
 
-## 2. 模型的输入输出约定
+## 2. Model input/output contract
 
-这些都必须和训练一致，脚本里已经按这个写好。
+All of these must match training. The script already follows them.
 
-| 项 | 约定 |
+| Item | Contract |
 |---|---|
-| prompt | `pour the orange juice from the pitcher into the glass cup`，要逐字一致。数据里 `/task_info` 写的"取离心管/拧盖"不对，训练时已经统一改成这句 |
-| 图像 | `observation/cam_high` 是俯视相机，960×540；`observation/cam_left_wrist` 和 `observation/cam_right_wrist` 是手腕相机，848×480。格式是 `uint8` **RGB**（HWC），必须是采集时的同一台相机、同一机位。模型内部会按比例缩放并补边到 224×224，你不用自己缩放 |
-| state | `observation/state`，14 维 float32，取**从臂（follow）**的当前位置。顺序是 `[左 j1..j6, 左夹爪, 右 j1..j6, 右夹爪]`，关节用弧度，夹爪是 0..1，和录制时同一约定 |
-| 输出 | `policy.infer(obs)["actions"]`，形状 (10, 14)，布局同 state，是**绝对**位置。每步 0.1 s（10 Hz），一块就是 1 秒。训练时 action 取**主臂（leader）**在同一时刻的位置，所以输出可以理解为"模型代替主臂" |
-| 内部处理 | 6 个关节训练时转成相对当前 state 的增量，夹爪保持绝对值。归一化统计量从 checkpoint 的 `assets/` 读。这些 policy 都会自动做，输出已经还原成绝对值 |
-| mask | 只有 mask 和 ControlVLA 模型需要。键是 `observation/base_region_mask`，形状 (2, H, W)，float32 0/1，槽位顺序是 `pitcher`、`cup`，只给俯视相机。推理时不做 MCR，图像保持原样 |
+| prompt | `pour the orange juice from the pitcher into the glass cup`, verbatim. The `/task_info` in the data ("取离心管/拧盖", pick up a centrifuge tube / unscrew a cap) is wrong; training replaced it with this sentence everywhere |
+| images | `observation/cam_high` is the top-down camera, 960×540; `observation/cam_left_wrist` and `observation/cam_right_wrist` are the wrist cameras, 848×480. Format is `uint8` **RGB** (HWC), and they must be the same cameras in the same mounting positions as during collection. The model resizes with padding to 224×224 internally, so do not resize yourself |
+| state | `observation/state`, 14-dim float32, the current position of the **follower** arms. Order is `[left j1..j6, left gripper, right j1..j6, right gripper]`, joints in radians, grippers in 0..1, same convention as the recordings |
+| output | `policy.infer(obs)["actions"]`, shape (10, 14), same layout as state, **absolute** positions. Each step is 0.1 s (10 Hz), so one chunk is 1 second. In training, the action is the **leader** arm position at the same instant, so think of the output as "the model replacing the leader arm" |
+| internal processing | During training the 6 joints of each arm are converted to deltas relative to the current state; grippers stay absolute. Normalization statistics are read from the checkpoint's `assets/`. The policy does all of this automatically, and the output is already converted back to absolute |
+| mask | Only the mask and ControlVLA models need it. Key `observation/base_region_mask`, shape (2, H, W), float32 0/1, slot order `pitcher`, `cup`, top-down camera only. No MCR at inference; images stay unchanged |
 
-训练数据的采样方式：在原始 MCAP 上按 10 Hz 等间隔取时刻。每个时刻每路相机取采集时间最近的一帧（按时间戳，不按帧号，因为有丢帧），关节做线性插值。
+How the training data was sampled: timestamps evenly spaced at 10 Hz over the raw MCAP. At each timestamp, each camera uses the frame with the nearest capture time (by timestamp, not frame index, because frames are sometimes dropped), and joints are linearly interpolated.
 
-**mask 必须和训练用同一套设置**，`rollout_hqi_pour.py` 顶部的 `MASK_*` 常量就是这套设置：
+**The masks must use exactly the training settings.** The `MASK_*` constants at the top of `rollout_hqi_pour.py` are these settings:
 
-- 检测器：HF `IDEA-Research/grounding-dino-base` + `facebook/sam-vit-base`。
-- 检测词：`orange juice pitcher` 和 `small glass cup`。
-- 阈值 0.2。
-- 槽位按框的面积分配，不按检测词：水壶占整图 2.5%–15%，杯子小于 2.5%。原因是水壶和杯子都是透明容器，DINO 分不清哪个是哪个，按检测词分会把两者对调。
-- 推理前先把图像长边缩到 512。
+- Detector: HF `IDEA-Research/grounding-dino-base` + `facebook/sam-vit-base`.
+- Detection phrases: `orange juice pitcher` and `small glass cup`.
+- Threshold 0.2.
+- Slots are assigned by box area, not by phrase: the pitcher covers 2.5%–15% of the image, the cup less than 2.5%. Both are transparent containers and DINO cannot tell which is which, so assigning by phrase swaps them.
+- The long side of the image is resized to 512 before detection.
 
-## 3. 环境
+## 3. Environment
 
 ```bash
-# 代码从这个仓库拿；三份权重（不拷 train_state，约 18 GB）和自检用的数据、mask（约 1.1 GB）从集群拷
+# Code comes from this repo; the three weights (without train_state, about 18 GB) and the self-check data and masks (about 1.1 GB) come from the cluster
 git clone git@github.com:yepengfei81-cpu/hqi_rss.git ~/openpi_hqi_pour
 P=/n/netscratch/hankyang_lab/Lab/pengfei
-rsync -r --exclude train_state <集群>:$P/openpi_hqi_pour/checkpoints/ ~/openpi_hqi_pour/checkpoints/
-rsync -r <集群>:$P/pi_data/hqi_pour50 <集群>:$P/pi_data/hqi_pour50_masks ~/pi_data/
+rsync -r --exclude train_state <cluster>:$P/openpi_hqi_pour/checkpoints/ ~/openpi_hqi_pour/checkpoints/
+rsync -r <cluster>:$P/pi_data/hqi_pour50 <cluster>:$P/pi_data/hqi_pour50_masks ~/pi_data/
 
 cd ~/openpi_hqi_pour
 GIT_LFS_SKIP_SMUDGE=1 uv sync
-# 必须做：把 mask 用到的 transformers 换成生成训练 mask 时的版本（原因见下面）
+# Required: switch the transformers used by the masks to the version that generated the training masks (reason below)
 uv pip install "transformers @ git+https://github.com/huggingface/transformers.git@b6fb4ec0f24cfad232de46a02441b9cc6362cd22" \
     huggingface_hub==1.26.0 tokenizers==0.22.2 regex==2025.11.3
 ```
 
-**为什么要换 transformers：** openpi 的 lock 文件锁的是 4.53.2，训练 mask 是用 5.8.0.dev0 生成的，也就是上面那个 commit。我用同一段代码抽了 63 帧比较：
+**Why change transformers:** openpi's lock file pins 4.53.2, but the training masks were generated with 5.8.0.dev0, the commit above. We compared 63 frames using the same code:
 
-| 环境 | 和训练 mask 的一致性 |
+| Environment | Agreement with training masks |
 |---|---|
-| 4.53.2 | 水壶 4 帧 IoU<0.9（最低 0.06）；杯子 3 帧对不上，都是一边检到、一边没检到 |
-| 换成上面这组版本（uv 会顺带装上 httpx 等依赖），其余是 openpi 原 lock 的包 | 63/63 帧逐像素一致，IoU 全部是 1.0 |
+| 4.53.2 | Pitcher: 4 frames with IoU < 0.9 (lowest 0.06). Cup: 3 frames disagree, each detected on one side and missed on the other |
+| The versions above (uv also pulls in httpx and other dependencies); everything else from openpi's original lock | 63/63 frames pixel-identical, IoU 1.0 on all |
 
-另外，4.53.2 下 `hf_mask.py` 原来会直接报错，因为 `from_pretrained` 不认 `dtype` 参数。我已经加了兼容写法，但只靠这个改动 mask 仍然对不上，所以还是要换版本。
+Also, under 4.53.2 `hf_mask.py` originally crashed, because `from_pretrained` does not accept the `dtype` argument. We added a compatibility fallback, but that alone does not make the masks match, so you still need to change the version.
 
-注意事项：
+Notes:
 
-- 换完以后请用 `.venv/bin/python` 运行，**不要用 `uv run`**。`uv run` 默认会按 lock 重新同步，把 transformers 降回 4.53.2。
-- 第一次运行要联网，会下载这几样东西：
-  - DINO 和 SAM，共约 1.25 GB，放在 `~/.cache/huggingface`；
-  - PaliGemma tokenizer，放在 `~/.cache/openpi`。
-- 下载完以后建议设 `HF_HUB_OFFLINE=1`。真机上网络或 DNS 出问题时，HF 会直接报错退出，不会退回去用本地缓存。
-- 显存：π0.5 推理实际占约 6.6 GB，加上 DINO+SAM 整卡约 9.3 GB。我们在 12 GB 的卡上同时跑两者。对 mask 和 ControlVLA 配置，脚本会自动设 JAX 不预占显存（`XLA_PYTHON_CLIENT_PREALLOCATE=false`，`ALLOCATOR=platform`），否则 DINO 会 OOM。
+- After the change, run with `.venv/bin/python`, **not `uv run`**. By default `uv run` re-syncs to the lock file and downgrades transformers back to 4.53.2.
+- The first run needs network access to download:
+  - DINO and SAM, about 1.25 GB in total, into `~/.cache/huggingface`;
+  - the PaliGemma tokenizer, into `~/.cache/openpi`.
+- After downloading, we recommend setting `HF_HUB_OFFLINE=1`. If the network or DNS fails on the robot, HF exits with an error instead of falling back to the local cache.
+- GPU memory: π0.5 inference uses about 6.6 GB; with DINO+SAM the whole GPU uses about 9.3 GB. We run both together on a 12 GB GPU. For the mask and ControlVLA configs, the script automatically stops JAX from preallocating memory (`XLA_PYTHON_CLIENT_PREALLOCATE=false`, `ALLOCATOR=platform`); otherwise DINO runs out of memory.
 
-## 4. 第一步：离线自检（不连机器人）
+## 4. Step 1: offline self-check (no robot)
 
 ```bash
 cd ~/openpi_hqi_pour
@@ -107,98 +107,98 @@ for c in pi05_hqi_pour50:pour50_base_v1 pi05_hqi_pour50_mask:pour50_mask_v1 pi05
 done
 ```
 
-这一步做的事：
+What this does:
 
-- 把第 3 条示教的三路视频和 state 当作传感器读数，每 10 步（1 秒）推理一次。
-- 把预测的 10 步和示教里接下来 10 步的主臂动作比较，最后打印每个关节的平均误差（度），同时给出"原地不动"的误差作为对照。
-- 对 mask 和 ControlVLA 模型，再把实时生成的 mask 和训练 mask 逐帧比较。
+- It treats the three videos and the state of demonstration 3 as sensor readings and runs inference every 10 steps (1 second).
+- It compares the 10 predicted steps with the next 10 leader-arm actions in the demonstration, and finally prints the mean error per joint (degrees). As a reference it also prints the error of "holding still" (the row labeled 不动).
+- For the mask and ControlVLA models, it also compares each live mask with the training mask.
 
-怎么看结果：
+How to read the results (the script prints in Chinese):
 
-- **mask 一致性**：应该是"检出一致 N/N、IoU 中位 1.0"。如果明显低于这个，说明环境不对，先按第 3 节换 transformers。
-- **动作误差**：右臂误差应该明显小于"不动"那一行。这是训练集上的开环预测，数值只用来确认整条链路没接错，比如 RGB/BGR 反了、关节顺序错了或者 prompt 不对，不代表真机效果。
+- **Mask agreement**: it should print `检出一致 N/N` (detection agreement N/N) and `IoU 中位 1.0` (median IoU 1.0). If it is clearly lower, the environment is wrong; switch transformers as in Section 3 first.
+- **Action error**: the right-arm error should be clearly smaller than the hold-still row. This is open-loop prediction on the training set, so the numbers only confirm the pipeline is wired correctly (for example, RGB/BGR swapped, wrong joint order or wrong prompt). They do not predict real-robot performance.
 
-我这边已经测过的部分：真实的输入输出变换、真实的 mask 生成和模型的图像预处理都跑通了，只把网络换成了假的（这边没有用真权重跑）。三个配置的观测都按约定进了模型：三路图像都是 224×224，mask 是 (2, 224, 224) 且只在俯视相机上有值，state 补齐到 32 维。实时 mask 和训练 mask 一致：ControlVLA 那次自检覆盖第 15 条整条示教，33/33 帧 IoU=1.0。实时路径我也用假机器人跑过：插值下发、急停、人工判定和记录文件都正常。**用真权重的自检数字还没跑**，你跑完把结果发我一下。
+What we have already tested: the real input/output transforms, real mask generation and the model's image preprocessing all run end to end, with only the network replaced by a fake one (we did not run the real weights). For all three configs, the observations reach the model as specified: all three images are 224×224, the mask is (2, 224, 224) and nonzero only on the top-down camera, and the state is padded to 32 dims. Live masks match the training masks: the ControlVLA self-check covered all of demonstration 15, with IoU 1.0 on 33/33 frames. We also ran the real-time path with a fake robot: interpolated commands, emergency stop, human judgment and the log files all work. **The self-check numbers with the real weights have not been run yet**; please send them to us once you have them.
 
-## 5. 第二步：接你的机器人
+## 5. Step 2: connect your robot
 
-在 `rollout_hqi_pour.py` 里实现 `RealRobot` 的 5 个方法。runner 只通过这 5 个方法碰硬件：
+Implement the 5 methods of `RealRobot` in `rollout_hqi_pour.py`. The runner touches the hardware only through these 5 methods:
 
-| 方法 | 要求 |
+| Method | Requirement |
 |---|---|
-| `read_images()` | 返回 `{cam_high, cam_left_wrist, cam_right_wrist}`，每路是 (H, W, 3) uint8 RGB。OpenCV 读出来是 BGR，要转一下 |
-| `read_joints()` | 返回从臂当前位置，14 维，即 `/robot/arm_{left,right}_follow/joint_states` 里的 position |
-| `command_joints(q)` | 下发 14 维目标位置，不能阻塞。最省事的接法是把 q 当成主臂位置，走遥操作时"主臂 → 从臂"的同一条控制链 |
-| `hold()` | 停在当前位置。每局结束或急停时调用 |
-| `close()` | 释放资源 |
+| `read_images()` | Return `{cam_high, cam_left_wrist, cam_right_wrist}`, each an (H, W, 3) uint8 RGB image. OpenCV reads BGR, so convert it |
+| `read_joints()` | Return the current follower position, 14 dims, i.e. the position in `/robot/arm_{left,right}_follow/joint_states` |
+| `command_joints(q)` | Send a 14-dim target position, non-blocking. The simplest approach is to treat q as the leader position and send it through the same "leader → follower" control path as teleoperation |
+| `hold()` | Stop at the current position. Called at the end of each episode and on emergency stop |
+| `close()` | Release resources |
 
-然后按这个顺序上机：
+Then bring it up on the robot in this order:
 
 ```bash
-# 1) 只读传感器、推理、打印，机器人不动。检查打印出的右臂目标角度合不合理、mask 覆盖率是否正常（俯视下水壶约 2%，杯子约 0.7%）
+# 1) Read sensors, run inference and print, without moving the robot. Check that the printed right-arm targets are sensible and the mask coverage looks normal (top-down view: pitcher about 2%, cup about 0.7%)
 .venv/bin/python rollout_hqi_pour.py --config-name pi05_hqi_pour50 --checkpoint checkpoints/pi05_hqi_pour50/pour50_base_v1/19999 \
     --robot real --dry-run --steps 50
-# 2) 真动。可以先 --speed-scale 0.5 慢速试；终端输入 q 回车 = 结束本局（Ctrl+C 也行）
+# 2) Real motion. You can start slow with --speed-scale 0.5; type q and Enter in the terminal to end the episode (Ctrl+C also works)
 .venv/bin/python rollout_hqi_pour.py --config-name pi05_hqi_pour50 --checkpoint checkpoints/pi05_hqi_pour50/pour50_base_v1/19999 \
     --robot real --start-pose dataset
 ```
 
-常用参数：
+Common options:
 
-- `--start-pose dataset`：每局开始前，用 4 秒慢慢移到 50 条示教第 0 帧的中位位姿。这个位姿基本就是零位，两个夹爪张开。开局姿态和示教一致很重要。
-- `--servo-hz 100`：每一步（0.1 s）内做线性插值，按 100 Hz 下发。如果你的从臂控制器自己会插值，可以设成 0，表示每步只发一次。
-- `--max-step-deg 20`：单步关节位移上限，用来防止野跳。示教里右臂单步最大是 17°。另外夹爪会被限制在 0..1。
-- `--chunk 10`（默认）：一块 10 步全部开环执行完再推理下一块。我们真机评测都用 10，因为离散事件（比如松夹爪）不会被中途打断。改小（比如 5）反应更快，重叠部分会按时间加权平均。
-- `--speed-scale`：执行速度倍率。1.0 是示教原速，不要超过 1。
+- `--start-pose dataset`: before each episode, move slowly over 4 seconds to the median frame-0 pose of the 50 demonstrations. This pose is essentially the zero position with both grippers open. Matching the demonstrations' starting pose matters.
+- `--servo-hz 100`: within each step (0.1 s), interpolate linearly and send at 100 Hz. If your follower controller interpolates on its own, set this to 0 to send only once per step.
+- `--max-step-deg 20`: per-step joint displacement limit, to prevent wild jumps. The largest single right-arm step in the demonstrations is 17°. Grippers are also clamped to 0..1.
+- `--chunk 10` (default): execute all 10 steps of a chunk open loop before inferring the next one. We used 10 for all real-robot evaluations, because discrete events such as releasing the gripper are not cut off midway. A smaller value (for example 5) reacts faster, and overlapping chunks are averaged with time-decaying weights.
+- `--speed-scale`: execution speed multiplier. 1.0 is the demonstration speed; do not exceed 1.
 
-## 6. 脚本在做什么
+## 6. What the script does
 
 ```
-每局:  (可选) 移到开局位姿
-       循环, 每步 0.1 s:
-         若 步数 % chunk == 0:
-           取三路图像 → 紧接着读从臂 state      ← 两者要尽量同一时刻
-           (mask/ControlVLA) 俯视图跑 DINO+SAM → 2 个槽位的 mask
-           policy.infer → (10, 14) 绝对目标
-         取当前这一步的目标 → 单步限幅 → 在 0.1 s 内插值下发
-       结束(q / 步数 / 超时) → hold() → 人工判定 y/n/x → 写 episodes.jsonl
+per episode:  (optional) move to the start pose
+              loop, 0.1 s per step:
+                if step % chunk == 0:
+                  read the three images → immediately read the follower state   ← keep these as close in time as possible
+                  (mask/ControlVLA) run DINO+SAM on the top-down image → masks for the 2 slots
+                  policy.infer → (10, 14) absolute targets
+                take this step's target → per-step clamp → interpolate and send within 0.1 s
+              end (q / step limit / timeout) → hold() → human judgment y/n/x → append to episodes.jsonl
 ```
 
-- 推理是同步的：推理期间机器人停住。在我们 12 GB 的卡上，π0.5 一次约 230 ms，mask 一帧约 350 ms，所以 mask 模型大约每走 1 秒停 0.6 秒。我们 AIRBOT 上的三方对比都是这样跑的。
-- 先读图、紧接着读 state，再跑 mask。如果 mask 放在两者之间，state 会比图像新约 0.3 秒，和训练里图像与 state 同一时刻的对齐不一致。
-- 第一次推理要 JIT 编译，约 1–2 分钟，之后每次几百毫秒。这次编译发生在第一局开始时，机器人还没动。
+- Inference is synchronous: the robot pauses during inference. On our 12 GB GPU, π0.5 takes about 230 ms and a mask frame about 350 ms, so a mask model pauses about 0.6 s per second of motion. All our three-way comparisons on AIRBOT ran this way.
+- Read the images first, then the state immediately after, and only then run the masks. If the masks ran in between, the state would be about 0.3 s newer than the images, unlike training, where image and state come from the same instant.
+- The first inference triggers JIT compilation, about 1–2 minutes; after that each inference takes a few hundred milliseconds. This compilation happens at the start of the first episode, before the robot moves.
 
-## 7. 我们在 AIRBOT 上怎么做 rollout，供参考
+## 7. How we do rollouts on AIRBOT, for reference
 
-我们自己的脚本是 `reference/local_inference_eef.py`。它只供阅读，在这个仓库里跑不起来，因为它依赖的 AIRBOT 驱动、相机和夹爪模型代码没有放进来。主循环在 `EEFRunner._run_episode`，观测在 `get_observation`，插值下发在 `_servo_macro`。
+Our own script is `reference/local_inference_eef.py`. It is for reading only and does not run in this repo, because the AIRBOT drivers, camera and gripper-model code it depends on are not included. The main loop is in `EEFRunner._run_episode`, observations in `get_observation`, and interpolated commands in `_servo_macro`.
 
-它和你的情况有一个主要区别：它是末端空间（EEF）的。模型输出的是每条臂各自开局坐标系里的末端位姿，我们用 250 Hz 的笛卡尔 servo 下发。这部分坐标变换对你的关节空间模型不适用。其余部分是同一套：循环结构、计时、mask、记录和评测方式。
+The main difference from your setup is that it works in end-effector (EEF) space. The model outputs end-effector poses in each arm's own start-pose frame, and we send them with a 250 Hz Cartesian servo. That coordinate transform does not apply to your joint-space models. Everything else is the same: loop structure, timing, masks, logging and evaluation protocol.
 
-这些做法是踩过坑以后定下来的：
+These practices came from problems we ran into:
 
-1. **prompt 逐字一致**。差一个词，模型就会进入它没见过的条件。
-2. **部署 mask 和训练 mask 用同一个文件、同一组参数**。上线前离线比对一遍：我们之前发现过训练时 mask 没读到、被静默填零的情况，所以训练 loader 现在开了 `strict_masks`，缺文件直接报错。
-3. **开局姿态和示教一致**。我们每局开始前把从臂对齐到主臂当前的关节角（`--start-from-lead`），保证关节构型和示教一样，否则逆解可能走另一个关节分支，撞到限位。
-4. **JAX 和 torch 共用一张卡**时，要设 JAX 不预占显存，否则 DINO 会 OOM。
-5. **真机上设 `HF_HUB_OFFLINE=1`**，避免网络抖一下进程就退出。
-6. **单步限幅和慢速试跑**。新模型先 `--dry-run`，再慢速，最后原速。
+1. **Use the prompt verbatim.** One different word puts the model in a condition it has never seen.
+2. **Generate deployment masks with the same file and parameters as the training masks.** Compare them offline before going on the robot. We once found training masks that had not loaded and were silently filled with zeros, so the training loader now enables `strict_masks` and fails on any missing file.
+3. **Match the demonstrations' starting pose.** Before each episode we align the follower to the leader's current joint angles (`--start-from-lead`), so the joint configuration matches the demonstrations; otherwise inverse kinematics may pick another joint branch and hit a limit.
+4. **When JAX and torch share one GPU**, stop JAX from preallocating memory, or DINO runs out of memory.
+5. **Set `HF_HUB_OFFLINE=1` on the robot**, so a network hiccup does not kill the process.
+6. **Use per-step clamping and slow trial runs.** For a new model, start with `--dry-run`, then slow speed, then full speed.
 
-**评测方式**（三个模型公平对比）：
+**Evaluation protocol** (fair comparison of the three models):
 
-- 每个模型计入 20 局。三个模型在同一场景、同一套物体摆放范围下跑，运行参数完全相同。
-- 每局结束立刻由人判定：成功 y、失败 n、作废 x。作废只用于操作失误或场景摆错这类和模型无关的情况，作废局不计入，记录直接删掉。
-- 每个模型最后报一个总成功率，不拆分。
-- 计时从第一条运动指令开始。
-- 我们还会在局内以 2 Hz 存俯视相机原图，方便事后剪视频。
+- Each model gets 20 counted episodes. All three run in the same scene with the same range of object placements and identical runtime parameters.
+- Right after each episode a person judges it: success y, failure n, void x. Void is only for problems unrelated to the model, such as operator error or a wrongly set-up scene; void episodes are not counted and their records are deleted.
+- Each model reports one overall success rate, not split further.
+- Timing starts at the first motion command.
+- We also save raw top-down camera frames at 2 Hz during each episode, to make videos afterwards.
 
-## 8. 记录文件
+## 8. Log files
 
-缺省写到 `data/runs/<时间>_<config>/`，可以用 `--record DIR` 指定，`--no-record` 关闭。
+By default logs go to `data/runs/<time>_<config>/`; set a directory with `--record DIR` or turn logging off with `--no-record`.
 
-| 文件 | 内容 |
+| File | Contents |
 |---|---|
-| `session.json` | 本次所有参数 |
-| `episodes.jsonl` | 每局一行：`human_success`、`counted`（作废=false）、`stop_reason`、`motion_time_s`、`n_infer`、备注 |
-| `epNNN/infer/NNNNN_cam_high.jpg` | 每次推理时的俯视图。mask 模型会叠加 mask：水壶绿色，杯子品红 |
-| `epNNN/log.npz` | 每次推理的 `state`、`actions`（10×14）、`infer_ms`、`obs_ms`、mask 覆盖率 |
-| `replay_eval.json` | 离线自检的统计结果 |
+| `session.json` | All parameters of the session |
+| `episodes.jsonl` | One line per episode: `human_success`, `counted` (false for void), `stop_reason`, `motion_time_s`, `n_infer`, note |
+| `epNNN/infer/NNNNN_cam_high.jpg` | The top-down image at each inference. For mask models the masks are overlaid: pitcher green, cup magenta |
+| `epNNN/log.npz` | Per inference: `state`, `actions` (10×14), `infer_ms`, `obs_ms`, mask coverage |
+| `replay_eval.json` | Statistics from the offline self-check |
