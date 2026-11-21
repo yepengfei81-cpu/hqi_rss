@@ -1,0 +1,169 @@
+import dataclasses
+from typing import TYPE_CHECKING
+
+import flax.nnx as nnx
+import jax
+import jax.numpy as jnp
+from typing_extensions import override
+
+from openpi.models import model as _model
+import openpi.models.gemma as _gemma
+from openpi.shared import array_typing as at
+import openpi.shared.nnx_utils as nnx_utils
+
+if TYPE_CHECKING:
+    from openpi.models.pi0 import Pi0
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0Config(_model.BaseModelConfig):
+    dtype: str = "bfloat16"
+    paligemma_variant: _gemma.Variant = "gemma_2b"
+    action_expert_variant: _gemma.Variant = "gemma_300m"
+    # 主干 LLM 的梯度重计算(remat)策略, 直接传给 jax.checkpoint_policies。
+    # "nothing_saveable"(默认, 上游行为): 全部重算, 最省显存、最慢。
+    # "dots_saveable": 保存矩阵乘结果只重算便宜算子, 用富裕显存换 ~20-35% 速度(结果数学等价)。
+    llm_remat_policy: str = "nothing_saveable"
+
+    # 方案C: 夹爪几何 token。开启后把 TCP 系下的夹爪点云(P,3)经点云 encoder 编成 1 个
+    # token 拼进 prefix, 让模型按几何/功能区做动作、并支持跨夹爪混训。默认关(行为不变)。
+    gripper_token: bool = False
+    num_gripper_points: int = 512
+    # 区域化: 每爪按 tip/mid/rear 编成 3 个 token(共享 PointNet 逐区编码 + 零初始化区域嵌入)。
+    # 开启后点云输入形状变为 (b, 3, P, 3), num_gripper_points 语义 = 每区点数。
+    region_tokens: bool = False
+    # FiLM 几何注入(方案B): 区域特征拼接 -> 零初始化逐臂投影 -> 加进动作专家 adaRMS cond
+    # (与流匹配时间步同一条通道)。动机: prefix token 注入可被注意力整体无视
+    # (probe_token_swap 实测 swap/全零/随机点云均 ≈1.0x 噪声地板), FiLM 直达每层、
+    # 不经注意力竞争。需要 gripper_token=True 且 pi05=True(adaRMS 仅 pi05 有)。
+    film_geometry: bool = False
+    # 相机遮断(仅训练): (p_wrist, p_env[, p_blind])。分段: u<p_w 只丢腕;
+    # 接着 p_e 只丢env; 接着 p_blind【全丢】(盲样本: 仅 state+prompt+点云——
+    # 爪身份唯一来源是点云, 压力最纯; v1 无盲段实测 env 残余识别力泄压, 10k 探针
+    # 与不遮断无差别)。部署不受影响。
+    cam_dropout: tuple[float, ...] = (0.0, 0.0, 0.0)
+    # force-aware Level A: 力矩前向预测辅助头维度(0=关)。与 action_out_proj 平行, 吃同一份
+    # 动作专家 suffix 特征 -> 预测未来 chunk 的 (H, effort_dim) 力矩(归一化后 MSE, 按 effort_mask
+    # 与 arm1_mask 屏蔽)。推理不用该头。effort_loss_weight 为其相对动作 loss 的权重。
+    effort_dim: int = 0
+    effort_loss_weight: float = 0.05
+    # mask prompt(移植自 hqi): 给 mask 选中的 SigLIP token 加可学习的槽位嵌入(零初始化)。默认关(行为不变)。
+    use_mask_prompts: bool = False
+    num_mask_slots: int = 2
+    # ControlVLA 近似复现(取自 ybao 的 openpi_controlvlabaseline): 每个物体 mask 编成 1 个物体 token,
+    # 经第三个"物体专家"(下标 2), 动作专家每层用独立 softmax 读物体 K/V(零初始化)。图像不改。
+    # 与 use_mask_prompts 互斥(模型里会报错), 保证它和我们的 mask 方法是两种方法。
+    use_controlvla: bool = False
+
+    # Set the model specific defaults.
+    action_dim: int = 32
+    action_horizon: int = 50
+    max_token_len: int = None  # type: ignore
+    # Pi05 has two differences from Pi0:
+    # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
+    # - the action expert uses adaRMSNorm to inject the flow matching timestep
+    pi05: bool = False
+    # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
+    discrete_state_input: bool = None  # type: ignore
+
+    pytorch_compile_mode: str | None = "max-autotune"
+
+    def __post_init__(self):
+        if self.max_token_len is None:
+            object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
+        if self.discrete_state_input is None:
+            object.__setattr__(self, "discrete_state_input", self.pi05)
+        if self.pytorch_compile_mode is not None:
+            assert self.pytorch_compile_mode in [
+                "default",
+                "reduce-overhead",
+                "max-autotune",
+                "max-autotune-no-cudagraphs",
+            ]
+
+    @property
+    @override
+    def model_type(self) -> _model.ModelType:
+        if self.pi05:
+            return _model.ModelType.PI05
+        return _model.ModelType.PI0
+
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "Pi0":
+        from openpi.models.pi0 import Pi0
+
+        return Pi0(self, rngs=nnx.Rngs(rng))
+
+    @override
+    def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
+        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+        image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+
+        with at.disable_typechecking():
+            observation_spec = _model.Observation(
+                images={
+                    "base_0_rgb": image_spec,
+                    "left_wrist_0_rgb": image_spec,
+                    "right_wrist_0_rgb": image_spec,
+                },
+                image_masks={
+                    "base_0_rgb": image_mask_spec,
+                    "left_wrist_0_rgb": image_mask_spec,
+                    "right_wrist_0_rgb": image_mask_spec,
+                },
+                state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
+                tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                gripper_pc=(jax.ShapeDtypeStruct(
+                    [batch_size, 3, self.num_gripper_points, 3] if self.region_tokens
+                    else [batch_size, self.num_gripper_points, 3], jnp.float32)
+                            if self.gripper_token else None),
+                effort=(jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.effort_dim], jnp.float32)
+                        if self.effort_dim > 0 else None),
+                effort_mask=(jax.ShapeDtypeStruct([batch_size, 1], jnp.float32)
+                             if self.effort_dim > 0 else None),
+                region_masks=(
+                    {
+                        k: jax.ShapeDtypeStruct([batch_size, self.num_mask_slots, *_model.IMAGE_RESOLUTION], jnp.float32)
+                        for k in ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+                    }
+                    if (self.use_mask_prompts or self.use_controlvla) else None
+                ),
+            )
+        action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
+
+        return observation_spec, action_spec
+
+    def get_freeze_filter(self) -> nnx.filterlib.Filter:
+        """Returns the freeze filter based on the model config."""
+        filters = []
+        has_lora = False
+        gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
+        action_expert_params_filter = nnx_utils.PathRegex(".*llm.*_1.*")
+        if "lora" in self.paligemma_variant:
+            filters.append(
+                gemma_params_filter,
+            )
+            if "lora" not in self.action_expert_variant:
+                # If only freeze gemma params, exclude action expert params.
+                filters.append(
+                    nnx.Not(action_expert_params_filter),
+                )
+            has_lora = True
+        elif "lora" in self.action_expert_variant:
+            filters.append(
+                action_expert_params_filter,
+            )
+            has_lora = True
+
+        if has_lora:
+            # If any lora is used, exclude all lora params.
+            filters.append(
+                nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+            )
+        if self.use_controlvla and filters:
+            # 物体专家(llm 下标 _2)是从零初始化的新网络, 没有预训练权重可做 LoRA, 必须整体可训练(同 ybao)。
+            filters.append(nnx.Not(nnx_utils.PathRegex(".*llm.*_2.*")))
+        if not filters:
+            return nnx.Nothing
+        return nnx.All(*filters)

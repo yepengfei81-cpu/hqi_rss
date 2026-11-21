@@ -1,0 +1,631 @@
+import dataclasses
+import logging
+import math
+
+import einops
+import flax.nnx as nnx
+import flax.nnx.bridge as nnx_bridge
+import jax
+import jax.numpy as jnp
+from typing_extensions import override
+
+from openpi.models import model as _model
+from openpi.models import pi0_config
+import openpi.models.gemma as _gemma
+import openpi.models.siglip as _siglip
+from openpi.shared import array_typing as at
+
+logger = logging.getLogger("openpi")
+
+
+def apply_mask_prompts(image_tokens, region_masks, prompt_embeddings):
+    """mask prompt(移植自 hqi 的 openpi_with_mask_realrobot, 逻辑不变): 把 [B,R,H,W] 二值 mask 最近邻缩到
+    SigLIP patch 网格(16x16), 给每个被 mask 覆盖的 token 加上对应槽位的可学习嵌入(多槽重叠则相加)。"""
+    batch_size, num_tokens, _ = image_tokens.shape
+    grid_size = math.isqrt(num_tokens)
+    if grid_size * grid_size != num_tokens:
+        raise ValueError(f"Cannot infer a square SigLIP patch grid from {num_tokens} tokens")
+    if region_masks.shape[1] != prompt_embeddings.shape[0]:
+        raise ValueError(f"mask 槽位数 {region_masks.shape[1]} != 嵌入数 {prompt_embeddings.shape[0]}")
+    masks = jax.image.resize(
+        region_masks.astype(image_tokens.dtype),
+        (batch_size, region_masks.shape[1], grid_size, grid_size),
+        method=jax.image.ResizeMethod.NEAREST,
+    )
+    masks = einops.rearrange(masks, "b r h w -> b (h w) r")
+    prompts = jnp.einsum("bnr,rd->bnd", masks, prompt_embeddings.astype(image_tokens.dtype))
+    return image_tokens + prompts
+
+
+def make_attn_mask(input_mask, mask_ar):
+    """Adapted from big_vision.
+
+    Tokens can attend to valid inputs tokens which have a cumulative mask_ar
+    smaller or equal to theirs. This way `mask_ar` bool[?B, N] can be used to
+    setup several types of attention, for example:
+
+      [[1 1 1 1 1 1]]: pure causal attention.
+
+      [[0 0 0 1 1 1]]: prefix-lm attention. The first 3 tokens can attend between
+          themselves and the last 3 tokens have a causal attention. The first
+          entry could also be a 1 without changing behaviour.
+
+      [[1 0 1 0 1 0 0 1 0 0]]: causal attention between 4 blocks. Tokens of a
+          block can attend all previous blocks and all tokens on the same block.
+
+    Args:
+      input_mask: bool[B, N] true if its part of the input, false if padding.
+      mask_ar: bool[?B, N] mask that's true where previous tokens cannot depend on
+        it and false where it shares the same attention mask as the previous token.
+    """
+    mask_ar = jnp.broadcast_to(mask_ar, input_mask.shape)
+    cumsum = jnp.cumsum(mask_ar, axis=1)
+    attn_mask = cumsum[:, None, :] <= cumsum[:, :, None]
+    valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
+    return jnp.logical_and(attn_mask, valid_mask)
+
+
+# ===== ControlVLA(近似复现, 原样取自 ybao 的 openpi_controlvlabaseline_code_20261103.zip, pi0.py) =====
+# 每个物体 mask -> 1 个物体 token(质心正弦位置 + 3 层 CNN 形状 + 槽位嵌入); 不改图像, 不加 mask prompt。
+def compute_mask_centroids(region_masks):
+    """Returns normalized (x, y) mask centroids and non-empty-mask flags."""
+    if region_masks.ndim != 4:
+        raise ValueError(f"Expected region masks [B, R, H, W], got {region_masks.shape}")
+    masks = jnp.clip(region_masks.astype(jnp.float32), 0.0, 1.0)
+    mass = jnp.sum(masks, axis=(-2, -1))
+    x_coordinates = jnp.linspace(0.0, 1.0, masks.shape[-1], dtype=jnp.float32)
+    y_coordinates = jnp.linspace(0.0, 1.0, masks.shape[-2], dtype=jnp.float32)
+    denominator = jnp.maximum(mass, 1.0)
+    centroid_x = jnp.einsum("brhw,w->br", masks, x_coordinates) / denominator
+    centroid_y = jnp.einsum("brhw,h->br", masks, y_coordinates) / denominator
+    return jnp.stack([centroid_x, centroid_y], axis=-1), mass > 0
+
+
+class ObjectCentricMaskEncoder(nnx.Module):
+    """Encodes each binary mask using centroid position and CNN geometry."""
+
+    def __init__(self, num_slots: int, output_width: int, rngs: nnx.Rngs):
+        self.num_slots = num_slots
+        self.mask_conv_1 = nnx.Conv(1, 16, kernel_size=(5, 5), strides=(2, 2), padding="SAME", rngs=rngs)
+        self.mask_conv_2 = nnx.Conv(16, 32, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs)
+        self.mask_conv_3 = nnx.Conv(32, 64, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs)
+        self.object_projection = nnx.Linear(128, output_width, rngs=rngs)
+        self.slot_embeddings = nnx.Param(
+            jax.random.normal(rngs.params(), (num_slots, output_width), dtype=jnp.float32) * 0.02
+        )
+
+    def __call__(self, region_masks):
+        if region_masks.shape[1] != self.num_slots:
+            raise ValueError(
+                f"Expected {self.num_slots} object-mask slots, got {region_masks.shape[1]}"
+            )
+
+        centroids, valid_masks = compute_mask_centroids(region_masks)
+        batch_size, num_slots = region_masks.shape[:2]
+        resized_masks = jax.image.resize(
+            region_masks.astype(jnp.float32),
+            (batch_size, num_slots, 32, 32),
+            method=jax.image.ResizeMethod.NEAREST,
+        )
+        geometry = einops.rearrange(resized_masks, "b r h w -> (b r) h w 1")
+        geometry = nnx.swish(self.mask_conv_1(geometry))
+        geometry = nnx.swish(self.mask_conv_2(geometry))
+        geometry = nnx.swish(self.mask_conv_3(geometry))
+        geometry = jnp.mean(geometry, axis=(1, 2))
+
+        flat_centroids = einops.rearrange(centroids, "b r xy -> (b r) xy")
+        position = jnp.concatenate(
+            [
+                posemb_sincos(flat_centroids[:, 0], 32, min_period=4e-3, max_period=4.0),
+                posemb_sincos(flat_centroids[:, 1], 32, min_period=4e-3, max_period=4.0),
+            ],
+            axis=-1,
+        )
+        object_tokens = self.object_projection(jnp.concatenate([position, geometry], axis=-1))
+        object_tokens = einops.rearrange(object_tokens, "(b r) d -> b r d", b=batch_size, r=num_slots)
+        object_tokens = object_tokens + self.slot_embeddings.value[None, :, :]
+        object_tokens = object_tokens * valid_masks[..., None].astype(object_tokens.dtype)
+        return object_tokens, valid_masks
+
+
+def make_controlvla_attn_mask(prefix_mask, prefix_ar, suffix_mask, suffix_ar, object_mask):
+    """Builds training attention with a separate action-to-object control branch."""
+    batch_size = prefix_mask.shape[0]
+    prefix_length = prefix_mask.shape[1]
+    suffix_length = suffix_mask.shape[1]
+    object_length = object_mask.shape[1]
+    base_mask = make_attn_mask(
+        jnp.concatenate([prefix_mask, suffix_mask], axis=1),
+        jnp.concatenate([prefix_ar, suffix_ar], axis=0),
+    )
+    full_mask = jnp.zeros(
+        (batch_size, prefix_length + suffix_length + object_length, prefix_length + suffix_length + object_length),
+        dtype=jnp.bool_,
+    )
+    base_length = prefix_length + suffix_length
+    full_mask = full_mask.at[:, :base_length, :base_length].set(base_mask)
+    # The action expert queries the object branch through its independent softmax.
+    full_mask = full_mask.at[:, prefix_length:base_length, base_length:].set(
+        suffix_mask[:, :, None] & object_mask[:, None, :]
+    )
+    # The object expert is conditioned on the frozen visual-language prefix.
+    return full_mask.at[:, base_length:, :prefix_length].set(
+        object_mask[:, :, None] & prefix_mask[:, None, :]
+    )
+
+
+def make_controlvla_inference_mask(prefix_mask, suffix_mask, suffix_ar, object_mask):
+    """Builds cached-inference attention for action and object query tokens."""
+    batch_size = prefix_mask.shape[0]
+    prefix_length = prefix_mask.shape[1]
+    suffix_length = suffix_mask.shape[1]
+    object_length = object_mask.shape[1]
+    full_mask = jnp.zeros(
+        (batch_size, suffix_length + object_length, prefix_length + suffix_length + object_length),
+        dtype=jnp.bool_,
+    )
+    suffix_self_mask = make_attn_mask(suffix_mask, suffix_ar)
+    full_mask = full_mask.at[:, :suffix_length, :prefix_length].set(
+        suffix_mask[:, :, None] & prefix_mask[:, None, :]
+    )
+    full_mask = full_mask.at[:, :suffix_length, prefix_length : prefix_length + suffix_length].set(
+        suffix_self_mask
+    )
+    full_mask = full_mask.at[:, :suffix_length, prefix_length + suffix_length :].set(
+        suffix_mask[:, :, None] & object_mask[:, None, :]
+    )
+    return full_mask.at[:, suffix_length:, :prefix_length].set(
+        object_mask[:, :, None] & prefix_mask[:, None, :]
+    )
+
+
+@at.typecheck
+def posemb_sincos(
+    pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
+) -> at.Float[at.Array, "b {embedding_dim}"]:
+    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    if embedding_dim % 2 != 0:
+        raise ValueError(f"embedding_dim ({embedding_dim}) must be divisible by 2")
+
+    fraction = jnp.linspace(0.0, 1.0, embedding_dim // 2)
+    period = min_period * (max_period / min_period) ** fraction
+    sinusoid_input = jnp.einsum(
+        "i,j->ij",
+        pos,
+        1.0 / period * 2 * jnp.pi,
+        precision=jax.lax.Precision.HIGHEST,
+    )
+    return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
+
+
+class PointNetEncoder(nnx.Module):
+    """方案C: 把夹爪点云 (b,p,3) 编成 1 个 token (b,1,emb)。
+    逐点共享 MLP + 对称 max-pool(置换不变, 点序无关)-> 投到 backbone 宽度。"""
+
+    def __init__(self, out_dim: int, rngs: nnx.Rngs, hidden: int = 256):
+        self.l1 = nnx.Linear(3, hidden, rngs=rngs)
+        self.l2 = nnx.Linear(hidden, hidden, rngs=rngs)
+        self.l3 = nnx.Linear(hidden, out_dim, rngs=rngs)
+
+    def __call__(self, pc: at.Float[at.Array, "b p 3"]) -> at.Float[at.Array, "b 1 e"]:
+        x = jax.nn.gelu(self.l1(pc))       # (b,p,h)
+        x = jax.nn.gelu(self.l2(x))        # (b,p,h)
+        x = jnp.max(x, axis=1)             # (b,h) 对称池化
+        tok = self.l3(x)                   # (b,emb)
+        return tok[:, None, :]             # (b,1,emb) 一个 token
+
+
+def _drop_cameras(rng, obs, probs):
+    """分段相机遮断(训练期): u<p_w 丢所有腕相机; 接着 p_e 只丢 env; 接着 p_b 全丢
+    (盲样本: 剩 state+prompt+点云, 爪身份唯一来源=点云, 梯度压力最纯)。
+    丢 = 图像置零 + image_mask 置 False(token 层被注意力屏蔽)。目的: 打破"爪身份
+    可从相机读出"的视觉冗余, 给几何通道(点云 token/FiLM)制造真实梯度压力。"""
+    p_w, p_e, p_b = probs
+    u = jax.random.uniform(rng, (obs.state.shape[0],))
+    blind = (u >= p_w + p_e) & (u < p_w + p_e + p_b)
+    drop_wrist = (u < p_w) | blind
+    drop_env = ((u >= p_w) & (u < p_w + p_e)) | blind
+    images = dict(obs.images)
+    masks = dict(obs.image_masks)
+    for k in images:
+        d = drop_wrist if "wrist" in k else drop_env
+        images[k] = jnp.where(d[:, None, None, None], jnp.zeros_like(images[k]), images[k])
+        masks[k] = masks[k] & ~d
+    return dataclasses.replace(obs, images=images, image_masks=masks)
+
+
+class Pi0(_model.BaseModel):
+    def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
+        super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+        self.pi05 = config.pi05
+        paligemma_config = _gemma.get_config(config.paligemma_variant)
+        action_expert_config = _gemma.get_config(config.action_expert_variant)
+        # ControlVLA: 第三个专家(物体专家, 下标 2)放最后, 预训练的 0/1 两个专家参数路径不变。
+        self.use_controlvla = bool(config.use_controlvla)
+        if self.use_controlvla and config.use_mask_prompts:
+            raise ValueError("use_controlvla 与 use_mask_prompts 不能同时开: ControlVLA 基线不得含 mask prompt")
+        expert_configs = [paligemma_config, action_expert_config]
+        if self.use_controlvla:
+            control_expert_config = _gemma.get_control_config(action_expert_config)
+            expert_configs.append(control_expert_config)
+        # TODO: rewrite gemma in NNX. For now, use bridge.
+        llm = nnx_bridge.ToNNX(
+            _gemma.Module(
+                configs=expert_configs,
+                embed_dtype=config.dtype,
+                adarms=config.pi05,
+                remat_policy=config.llm_remat_policy,
+            )
+        )
+        use_adarms = [False, True] if config.pi05 else [False, False]
+        llm.lazy_init(rngs=rngs, method="init", use_adarms=use_adarms + ([False] if self.use_controlvla else []))
+        img = nnx_bridge.ToNNX(
+            _siglip.Module(
+                num_classes=paligemma_config.width,
+                variant="So400m/14",
+                pool_type="none",
+                scan=True,
+                dtype_mm=config.dtype,
+            )
+        )
+        img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
+        self.PaliGemma = nnx.Dict(llm=llm, img=img)
+        self.use_mask_prompts = bool(config.use_mask_prompts)
+        if self.use_mask_prompts:
+            # 与 hqi 唯一的实现差异: 参数存 float32(他用 config.dtype=bfloat16)。bf16 下 Adam 每步 ~lr(1e-5 量级)的
+            # 更新在参数涨到 ~0.005 后会被舍入成 0, 嵌入长不大; 他 22500 的每维最大值 0.0042 正卡在这里。
+            # 加到图像 token 时仍按 token 的 dtype 计算, 前向数值与他一致。
+            self.mask_prompt_embeddings = nnx.Param(
+                jnp.zeros((config.num_mask_slots, paligemma_config.width), dtype=jnp.float32))
+        if config.gripper_token:
+            self.gripper_encoder = PointNetEncoder(paligemma_config.width, rngs=rngs)
+            if config.region_tokens:
+                # 区域嵌入(tip/mid/rear 身份), 零初始化: 起步时各 token 纯由该区几何决定,
+                # 区域身份信息随训练渐进学入(不破坏底座先验)。
+                self.gripper_region_emb = nnx.Param(
+                    jnp.zeros((3, paligemma_config.width), dtype=jnp.float32))
+        self.film_geometry = bool(config.gripper_token and config.film_geometry)
+        if self.film_geometry:
+            assert config.pi05, "film_geometry 依赖 adaRMS cond, 仅 pi05 可用"
+            # FiLM 几何注入(方案B): 每臂区域特征拼接 -> 零初始化投影 -> 加进 adaRMS cond。
+            # 零初始化(kernel+bias 全零) => 起步严格等价于纯时间步 cond, 调制渐进生效。
+            # 逐臂独立投影(不求和共享)保留"臂0=GET/臂1=parallel"与对调的可区分性。
+            # 命名含 gripper: 权重加载白名单(.*(lora|gripper).*)与可训练性(不含 llm)自动正确。
+            n_reg = 3 if config.region_tokens else 1
+            self.gripper_film_proj = nnx.Linear(
+                n_reg * paligemma_config.width, action_expert_config.width,
+                kernel_init=nnx.initializers.zeros_init(), rngs=rngs)
+            self.gripper_film_proj_1 = nnx.Linear(
+                n_reg * paligemma_config.width, action_expert_config.width,
+                kernel_init=nnx.initializers.zeros_init(), rngs=rngs)
+        cd = tuple(config.cam_dropout) + (0.0,) * 3   # 兼容 2 元组旧写法
+        assert sum(cd[:3]) <= 1.0, "cam_dropout 概率之和须<=1(互斥分段)"
+        self.cam_dropout = cd[:3]
+        # force-aware Level A: 力矩前向预测头, 与 action_out_proj 平行(同一份 suffix 特征)。
+        # 命名含 effort => 权重加载白名单 .*(lora|gripper|effort).* 覆盖; 不在 llm 下 => 可训练。
+        self.effort_dim = int(config.effort_dim)
+        self.effort_loss_weight = float(config.effort_loss_weight)
+        if self.effort_dim > 0:
+            self.effort_head = nnx.Linear(action_expert_config.width, self.effort_dim, rngs=rngs)
+        self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+        if config.pi05:
+            self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+        else:
+            self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+            self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
+            self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+        self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+        # 物体编码器放在最后创建: 它消耗的随机数不能挤占前面模块的。否则同一 seed 下夹爪点云编码器等
+        # 随机初始化的模块和 baseline/mask 不一致, 等于换了种子(step 0 loss 0.52 vs baseline 0.94 就是这个原因)。
+        if self.use_controlvla:
+            self.object_mask_encoder = ObjectCentricMaskEncoder(
+                num_slots=config.num_mask_slots,
+                output_width=control_expert_config.width,
+                rngs=rngs,
+            )
+
+        # This attribute gets automatically set by model.train() and model.eval().
+        self.deterministic = True
+
+    def _gripper_tokens(self, pc):
+        """夹爪点云 -> token(s)。(b,p,3) -> (b,1,e) 单全局 token;
+        区域模式 (b,3,p,3) -> (b,3,e): 共享 PointNet 逐区编码 + 零初始化区域嵌入。"""
+        if pc.ndim == 4:
+            b, r = pc.shape[0], pc.shape[1]
+            toks = self.gripper_encoder(einops.rearrange(pc, "b r p c -> (b r) p c"))  # ((b r),1,e)
+            toks = einops.rearrange(toks[:, 0, :], "(b r) e -> b r e", b=b, r=r)
+            return toks + self.gripper_region_emb.value[None, :, :]
+        return self.gripper_encoder(pc)
+
+    def _film_cond(self, obs: _model.Observation):
+        """FiLM 几何 cond: 每臂区域特征(共享 PointNet)拼接 -> 零初始化逐臂投影, 相加。
+        与 prefix token 注入互补——那条路可被注意力无视, 这条直达动作专家每层 adaRMS。
+        臂1 按 arm1_mask 屏蔽(单臂样本臂1贡献=0)。返回 (b, expert_width)。"""
+
+        def flat(pc):
+            f = self._gripper_tokens(pc)                        # (b, 1|3, e)
+            return einops.rearrange(f, "b r e -> b (r e)")
+
+        cond = self.gripper_film_proj(flat(obs.gripper_pc))
+        if obs.gripper_pc_1 is not None:
+            c1 = self.gripper_film_proj_1(flat(obs.gripper_pc_1))
+            if obs.arm1_mask is not None:
+                am = jnp.asarray(obs.arm1_mask).reshape((c1.shape[0], -1))[:, :1]
+                c1 = c1 * (am > 0.5).astype(c1.dtype)
+            cond = cond + c1
+        return cond
+
+    @at.typecheck
+    def embed_prefix(
+        self, obs: _model.Observation
+    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+        input_mask = []
+        ar_mask = []
+        tokens = []
+        # embed images
+        for name in obs.images:
+            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            if self.use_mask_prompts and obs.region_masks is not None and name in obs.region_masks:
+                image_tokens = apply_mask_prompts(image_tokens, obs.region_masks[name], self.mask_prompt_embeddings.value)
+
+            tokens.append(image_tokens)
+            input_mask.append(
+                einops.repeat(
+                    obs.image_masks[name],
+                    "b -> b s",
+                    s=image_tokens.shape[1],
+                )
+            )
+            # image tokens attend to each other
+            ar_mask += [False] * image_tokens.shape[1]
+
+        # add language (aka tokenized inputs)
+        if obs.tokenized_prompt is not None:
+            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+            tokens.append(tokenized_inputs)
+            input_mask.append(obs.tokenized_prompt_mask)
+            # full attention between image and language inputs
+            ar_mask += [False] * tokenized_inputs.shape[1]
+
+        # 方案C: 夹爪几何 token(和图像/文本同档: 全注意力)。臂0(单臂=唯一)。
+        # 全局模式 1 token; 区域模式 3 token(tip/mid/rear)。
+        if obs.gripper_pc is not None:
+            g_tok = self._gripper_tokens(obs.gripper_pc)          # (b, 1|3, emb)
+            tokens.append(g_tok)
+            input_mask.append(jnp.ones((g_tok.shape[0], g_tok.shape[1]), dtype=jnp.bool_))
+            ar_mask += [False] * g_tok.shape[1]
+
+        # 双臂: 臂1 夹爪 token(共用同一 PointNet)。mask=arm1_mask: 单臂样本(=0)整组屏蔽。
+        if obs.gripper_pc_1 is not None:
+            g_tok1 = self._gripper_tokens(obs.gripper_pc_1)       # (b, 1|3, emb)
+            tokens.append(g_tok1)
+            if obs.arm1_mask is not None:
+                am = jnp.asarray(obs.arm1_mask).reshape((g_tok1.shape[0], -1))[:, 0] > 0.5   # (b,)
+                m1 = einops.repeat(am, "b -> b s", s=g_tok1.shape[1])
+            else:
+                m1 = jnp.ones((g_tok1.shape[0], g_tok1.shape[1]), dtype=jnp.bool_)
+            input_mask.append(m1)
+            ar_mask += [False] * g_tok1.shape[1]
+
+        tokens = jnp.concatenate(tokens, axis=1)
+        input_mask = jnp.concatenate(input_mask, axis=1)
+        ar_mask = jnp.array(ar_mask)
+        return tokens, input_mask, ar_mask
+
+    def embed_objects(self, obs: _model.Observation):
+        """ControlVLA(原样取自 ybao): 每路相机的 mask 编成定长物体 token 序列。
+        没有 mask 的相机(我们只给头部相机 mask, 腕部由 preprocess 补零)或空 mask -> 该 token 无效, 不参与注意力。"""
+        if not self.use_controlvla:
+            raise RuntimeError("Object tokens requested while ControlVLA is disabled")
+        if obs.region_masks is None:
+            raise ValueError("ControlVLA requires region masks")
+
+        tokens = []
+        input_masks = []
+        for name in obs.images:
+            if name not in obs.region_masks:
+                raise ValueError(f"ControlVLA region masks are missing camera {name!r}")
+            camera_tokens, camera_object_mask = self.object_mask_encoder(obs.region_masks[name])
+            camera_object_mask = camera_object_mask & obs.image_masks[name][:, None]
+            camera_tokens = camera_tokens * camera_object_mask[..., None].astype(camera_tokens.dtype)
+            tokens.append(camera_tokens)
+            input_masks.append(camera_object_mask)
+        return jnp.concatenate(tokens, axis=1), jnp.concatenate(input_masks, axis=1)
+
+    @at.typecheck
+    def embed_suffix(
+        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+    ) -> tuple[
+        at.Float[at.Array, "b s emb"],
+        at.Bool[at.Array, "b s"],
+        at.Bool[at.Array, " s"],
+        at.Float[at.Array, "b emb"] | None,
+    ]:
+        input_mask = []
+        ar_mask = []
+        tokens = []
+        if not self.pi05:
+            # add a single state token
+            state_token = self.state_proj(obs.state)[:, None, :]
+            tokens.append(state_token)
+            input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
+            # image/language inputs do not attend to state or actions
+            ar_mask += [True]
+
+        action_tokens = self.action_in_proj(noisy_actions)
+        # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
+        time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+        if self.pi05:
+            # time MLP (for adaRMS)
+            time_emb = self.time_mlp_in(time_emb)
+            time_emb = nnx.swish(time_emb)
+            time_emb = self.time_mlp_out(time_emb)
+            time_emb = nnx.swish(time_emb)
+            action_expert_tokens = action_tokens
+            adarms_cond = time_emb
+            if self.film_geometry and obs.gripper_pc is not None:
+                adarms_cond = adarms_cond + self._film_cond(obs)
+        else:
+            # mix timestep + action information using an MLP (no adaRMS)
+            time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+            action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
+            action_time_tokens = self.action_time_mlp_in(action_time_tokens)
+            action_time_tokens = nnx.swish(action_time_tokens)
+            action_time_tokens = self.action_time_mlp_out(action_time_tokens)
+            action_expert_tokens = action_time_tokens
+            adarms_cond = None
+        tokens.append(action_expert_tokens)
+        input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
+        # image/language/state inputs do not attend to action tokens
+        ar_mask += [True] + ([False] * (self.action_horizon - 1))
+        tokens = jnp.concatenate(tokens, axis=1)
+        input_mask = jnp.concatenate(input_mask, axis=1)
+        ar_mask = jnp.array(ar_mask)
+        return tokens, input_mask, ar_mask, adarms_cond
+
+    @override
+    def compute_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False,
+        aux: dict | None = None,
+    ) -> at.Float[at.Array, "*b ah"]:
+        preprocess_rng, drop_rng, noise_rng, time_rng = jax.random.split(rng, 4)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        if train and sum(self.cam_dropout) > 0:
+            observation = _drop_cameras(drop_rng, observation, self.cam_dropout)
+
+        batch_shape = actions.shape[:-2]
+        noise = jax.random.normal(noise_rng, actions.shape)
+        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        time_expanded = time[..., None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+
+        # one big forward pass of prefix + suffix at once
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+        if self.use_controlvla:
+            object_tokens, object_mask = self.embed_objects(observation)
+            input_mask = jnp.concatenate([prefix_mask, suffix_mask, object_mask], axis=1)
+            attn_mask = make_controlvla_attn_mask(
+                prefix_mask, prefix_ar_mask, suffix_mask, suffix_ar_mask, object_mask)
+            positions = jnp.cumsum(input_mask, axis=1) - 1
+            (prefix_out, suffix_out, _), _ = self.PaliGemma.llm(
+                [prefix_tokens, suffix_tokens, object_tokens],
+                mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond, None],
+            )
+        else:
+            input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+            ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+            attn_mask = make_attn_mask(input_mask, ar_mask)
+            positions = jnp.cumsum(input_mask, axis=1) - 1
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+            )
+        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+        action_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)                    # (b, ah)
+        total = action_loss
+        # force-aware Level A: 动作条件化前向预测——同一份 suffix 特征(含带噪动作+时间步)
+        # 预测未来 chunk 的力矩; 按 effort_mask(无遥测样本) 与 arm1_mask(单臂样本的臂1 7维) 屏蔽。
+        if self.effort_dim > 0 and observation.effort is not None:
+            pred = self.effort_head(suffix_out[:, -self.action_horizon :])          # (b, ah, d)
+            b = pred.shape[0]
+            m = jnp.ones((b, 1, self.effort_dim), pred.dtype)
+            if observation.effort_mask is not None:
+                m = m * jnp.asarray(observation.effort_mask, pred.dtype).reshape((b, 1, 1))
+            if observation.arm1_mask is not None and self.effort_dim == 14:
+                am = (jnp.asarray(observation.arm1_mask).reshape((b, 1, 1)) > 0.5).astype(pred.dtype)
+                m = m * jnp.concatenate(
+                    [jnp.ones((b, 1, 7), pred.dtype), jnp.broadcast_to(am, (b, 1, 7))], axis=-1)
+            sq = jnp.square(pred - jnp.asarray(observation.effort, pred.dtype)) * m  # (b, ah, d)
+            per_t = sq.sum(-1) / jnp.maximum(m.sum(-1), 1.0)                       # (b, ah)
+            total = action_loss + self.effort_loss_weight * per_t
+            if aux is not None:
+                aux["effort_loss"] = sq.sum() / jnp.maximum(m.sum() * pred.shape[1], 1.0)
+        if aux is not None:
+            aux["action_loss"] = jnp.mean(action_loss)
+        return total
+
+    @override
+    def sample_actions(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> _model.Actions:
+        observation = _model.preprocess_observation(None, observation, train=False)
+        # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
+        # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        # first fill KV cache with a forward pass of the prefix
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        prefix_experts = [prefix_tokens, None] + ([None] if self.use_controlvla else [])
+        _, kv_cache = self.PaliGemma.llm(prefix_experts, mask=prefix_attn_mask, positions=positions)
+        if self.use_controlvla:
+            object_tokens, object_mask = self.embed_objects(observation)
+
+        def step(carry):
+            x_t, time = carry
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
+            if self.use_controlvla:
+                full_attn_mask = make_controlvla_inference_mask(prefix_mask, suffix_mask, suffix_ar_mask, object_mask)
+                current_mask = jnp.concatenate([suffix_mask, object_mask], axis=-1)
+                positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(current_mask, axis=-1) - 1
+                (prefix_out, suffix_out, _), _ = self.PaliGemma.llm(
+                    [None, suffix_tokens, object_tokens],
+                    mask=full_attn_mask,
+                    positions=positions,
+                    kv_cache=kv_cache,
+                    adarms_cond=[None, adarms_cond, None],
+                )
+                assert prefix_out is None
+                v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+                return x_t + dt * v_t, time + dt
+
+            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
+            # other
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
+            # prefix tokens
+            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
+            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
+            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            assert full_attn_mask.shape == (
+                batch_size,
+                suffix_tokens.shape[1],
+                prefix_tokens.shape[1] + suffix_tokens.shape[1],
+            )
+            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            assert prefix_out is None
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+            return x_t + dt * v_t, time + dt
+
+        def cond(carry):
+            x_t, time = carry
+            # robust to floating-point error
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        return x_0

@@ -1,0 +1,874 @@
+#!/usr/bin/env python3
+"""
+AirBot Play 任务空间(EEF) 实时推理 —— 单臂/双臂统一版。
+
+一个 Runner 覆盖四种组合:
+  模型维度(由 --config-name 对应 config 的 data.dual 自动判断, 不用手选):
+    10D 单臂模型(如 pi05_cotrain_eef_grip_aug) / 20D 双臂模型(如 pi05_cotrain_dualarm)
+  驱动硬件(--dual-arm 决定):
+    只驱动臂0(右) / 驱动臂0+臂1(左)。20D 模型只驱动臂0时, 臂1 自动按训练里单臂样本
+    的编码喂给模型(state=REST10, arm1_mask=0, 左腕黑图) —— 即原 --arm1-rest, 已自动化。
+
+W' 系: 每条臂在开局位姿各建一个 W'(原点=指尖, yaw 归零), 模型输入输出均在 W' 相对系。
+--start-from-lead: rollout 前把在场的 follow 臂对齐到各自 lead(遥操作臂)的当前关节角
+——与采集时的对齐一致, 保证 IK 关节分支与示教相同(防撞限位)。单/双臂都支持。
+
+用法示例:
+  # 20D 权重跑单臂任务(臂1 自动 rest)
+  python local_inference_eef.py --checkpoint <ckpt20d> --config-name pi05_cotrain_dualarm_film \
+      --task "stack the bricks into a pyramid" --arm0-gripper parallel --start-from-lead
+  # 20D 双臂(切橡皮泥)
+  python local_inference_eef.py --checkpoint <ckpt20d> --config-name pi05_cotrain_dualarm_film \
+      --task "cut the play-dough with the knife" --dual-arm \
+      --arm0-gripper get --arm1-gripper parallel --start-from-lead
+  # (旧 10D 单臂配置已从 config.py 删除, 要部署老 10D checkpoint 需从 git 历史找回配置)
+  # 擦黑板(接触任务): 加 --env-mask 0 --board-z-auto
+  # 单任务擦黑板 pi05_single_parallel_wipe(_mask): 训练数据 env_mask=1(头部相机有效), 只加 --board-z-auto;
+  # mask 版再加 --mask-backend hf(检测词与"板擦须在白板内"自动按 MASK_PROMPTS/MASK_INSIDE, 与训练一致)
+
+先 --dry-run(只推理+打印, 不动)验证坐标链。急停/结束本局: q / Esc(有窗口)或终端输入 q。
+一局结束后停在原地 + 张开夹爪, 然后问人: 成功 y / 失败 n / 作废 x, 进度, 备注; 复位场景后输入 y 才开始下一局
+(h=先回零), n=结束会话(可选回零)。每局计时 motion_time_s = 第一条运动指令 -> 结束键(对齐 lead / JIT 热身不算)。
+会话记录(缺省 data/runs/<时间>_<任务>/, --record DIR 指定, --no-record 关), 与 openpi_with_mask_realrobot 的 runner 同一布局:
+  session.json / episodes.jsonl(每局 human_success, motion_time_s, progress_pct, note, counted, stop_reason, n_infer)
+  epNNN/head/NNNNN_TTTTT.Ts.jpg + frames.csv(头部相机原图, --head-hz 默认 2Hz)   epNNN/infer/(每次推理的几路图)   epNNN/log.npz
+头部帧拼视频: ffmpeg -framerate 2 -pattern_type glob -i 'epNNN/head/*.jpg' -c:v libx264 -pix_fmt yuv420p epNNN.mp4
+"""
+import os
+import sys as _sys
+
+if "--mask-backend" in _sys.argv:          # 与 torch(DINO+SAM) 同进程: JAX 按需分配, 不预占 75% 显存
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    # 不预占也不够: JAX 的缓存池加载权重后仍占着 8.0G(实用 6.6G), DINO 在 12G 卡上 OOM。
+    # platform 分配器用完即还, 整卡约 9.3G; 实测 pi05 推理 230ms, 与默认分配器的 226ms 持平。
+    os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
+    # DINO/SAM 已在本地 HF 缓存里; 联网时 HF 仍会去查更新, 断网/DNS 失败会直接崩(不回落缓存), 真机上不依赖网络
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import argparse
+import json
+import logging
+import pathlib
+import queue
+import re
+import sys
+import threading
+import time
+
+import cv2
+import numpy as np
+
+from openpi.policies import policy_config as _policy_config
+from openpi.training import config as _config
+
+_ROOT = pathlib.Path(__file__).parent
+sys.path.insert(0, str(_ROOT / "airbot"))
+sys.path.insert(0, str(_ROOT / "umi"))
+sys.path.insert(0, str(_ROOT / "gripper_geom"))
+from collect_data import DualCamera  # noqa: E402  color-only 相机(并行启动, 带宽减半)
+from gripper_params import get_params  # noqa: E402  每爪开合范围 + 指尖偏移 + board_z
+from joint_guard import JointGuard  # noqa: E402  关节逼近限位提示
+from play_sdk import PlayRealRobot, RobotMode  # noqa: E402
+from umi_to_lerobot import quat_to_rot, rot6d_to_rot, rot_to_6d  # noqa: E402
+from replay_check import rot_to_quat_xyzw, to_base_frame, base_to_wprime  # noqa: E402
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+WIPE_GLIDE_DEPTH = 0.286   # 擦黑板示教里"贴板滑动"的典型下压落差(W'z), board_z 配准用
+# mask prompt 模型各槽位的检测词与约束, 必须与生成训练 mask 时一致(扫地: hqi 的 brush 脚本; 擦黑板: scripts/gen_head_masks.py)
+MASK_PROMPTS = {"blue_dustpan": "blue dustpan|dustpan", "hand_brush": "hand brush|brush",
+                "eraser": "black eraser|eraser", "whiteboard": "white board|whiteboard",
+                "mug": "white mug|mug", "mug_tree": "black stand"}
+MASK_MULTI = {"mug"}                     # 挂杯两个一样的杯子: 取全部实例的并集(≤3), 不是只取最高分一个
+MASK_MAX_BOX_FRAC = {"mug_tree": 0.6}    # 有这些槽位时丢掉面积 >60% 整图的框("black stand" 偶尔给整图框)
+MASK_SUBTRACT = {"mug_tree": ["mug"]}    # 杯架 mask 扣掉杯子(SAM 会把挂上去的杯子算进杯架)
+MASK_INSIDE = {"eraser": "whiteboard"}   # 板擦框中心须在白板框内, 否则当没检到(否则会框到后面架子上的黑色物体)
+MASK_INSIDE_MARGIN = 0.3                 # 白板框每边外扩 30%: 板擦放在白板旁边的桌上也算(见 airbot/hf_mask.py)
+EYE3 = np.eye(3)
+ZERO_JOINT = [0.0] * 6
+# 20D 双臂模型里单臂样本的臂1占位状态(pos0 + rot6d单位 + grip0), 与 pack_lerobot REST10 一致
+REST10 = np.array([0, 0, 0, 1, 0, 0, 0, 1, 0, 0], dtype=np.float32)
+
+
+def nlerp(q0, q1, a):
+    """四元数归一化线性插值(小步够用, 避免依赖 scipy slerp)。"""
+    q0, q1 = np.asarray(q0, float), np.asarray(q1, float)
+    if np.dot(q0, q1) < 0:
+        q1 = -q1
+    q = (1 - a) * q0 + a * q1
+    return q / np.linalg.norm(q)
+
+
+class _ArmCtx:
+    """单条臂的部署上下文: 句柄 + 该爪开合范围/指尖偏移 + 点云 token + W' 帧 + servo 插值状态。"""
+
+    def __init__(self, handle, gripper_name, gripper_cloud, arm_frame=False):
+        self.h = handle
+        gp = get_params(gripper_name)
+        self.g_close = float(gp["close"]); self.g_open = float(gp["open"])
+        # arm_frame(去几何标定的模型): 位姿直接用机械臂报点, 不补指尖偏移——
+        # 模型自己从点云读出指尖伸多远。开合标定仍需要(传动比不在点云里)。
+        self.tcp_offset = (np.zeros(3) if arm_frame
+                           else np.asarray(gp["tcp_offset"], float))
+        self.name = gripper_name
+        self.pc = gripper_cloud            # (P,3) 已子采样; None=不注入
+        self.start_pos = None; self.start_yaw = None
+        self.last_p = None; self.last_q = None
+
+    def _ee_to_tip(self, p, q):
+        return np.asarray(p, float) + quat_to_rot(*q) @ self.tcp_offset
+
+    def _tip_to_ee(self, p_tip, q):
+        return np.asarray(p_tip, float) - quat_to_rot(*q) @ self.tcp_offset
+
+    def establish_wprime(self, board_z=None, press=0.005, z_offset=0.0):
+        """在当前位姿建 W'。board_z(擦黑板等接触任务): 把原点 z 配准到
+        board_z + 示教下压落差 - 压入量, 让模型的下压正好落在"轻压板面"处。"""
+        p, q = self.h.get_end_pose()
+        R = quat_to_rot(*q); fwd = R[:, 0]
+        self.start_pos = self._ee_to_tip(p, q)   # W' 原点锚到指尖
+        if board_z is not None:
+            self.start_pos[2] = board_z + WIPE_GLIDE_DEPTH - press
+            print(f">>>   [{self.name}] 起点 z 按 board_z 配准: {board_z:+.3f} press={press:.3f} "
+                  f"-> 原点 z={self.start_pos[2]:.3f}", flush=True)
+        self.start_pos[2] += z_offset
+        self.start_yaw = float(np.degrees(np.arctan2(fwd[1], fwd[0])))
+        print(f">>>   [{self.name}] W' 原点={self.start_pos.round(3).tolist()} "
+              f"yaw0={self.start_yaw:.1f}°", flush=True)
+
+    def state_wprime(self):
+        """当前 base 位姿 -> 本臂 W' 系 10D = pos3 + rot6d6 + grip1(按该爪开合范围归一化)。"""
+        p, q = self.h.get_end_pose()
+        R = quat_to_rot(*q)
+        p_tip = self._ee_to_tip(p, q)
+        pw, Rw = base_to_wprime(p_tip, R, self.start_pos, self.start_yaw, EYE3, [0, 0, 0])
+        eef = self.h.get_eef_pos()
+        g = eef[0] if eef and len(eef) > 0 else 0.0
+        g01 = float(np.clip((g - self.g_close) / (self.g_open - self.g_close), 0.0, 1.0))
+        return np.concatenate([pw, rot_to_6d(Rw), [g01]]).astype(np.float32)
+
+    def action_to_base(self, a_w):
+        """本臂 W' 动作 (10,) -> (base 指尖 pos(3), quat(xyzw), grip01)。"""
+        cmd_pos, cmd_R = to_base_frame(a_w[None, :3], [rot6d_to_rot(a_w[3:9])],
+                                       self.start_pos, self.start_yaw, EYE3, [0, 0, 0])
+        return cmd_pos[0], rot_to_quat_xyzw(cmd_R[0]), float(np.clip(a_w[9], 0.0, 1.0))
+
+    def seed_last(self, dry_run):
+        if dry_run:
+            self.last_p = np.asarray(self.start_pos, float)
+            self.last_q = np.asarray([0.0, 0.0, 0.0, 1.0], float)
+        else:
+            ee_p, q = self.h.get_end_pose()
+            self.last_p = np.asarray(self._ee_to_tip(ee_p, q), float)
+            self.last_q = np.asarray(q, float)
+
+
+class EEFRunner:
+    """统一推理 Runner: 模型 10D/20D 自动判断(config.data.dual), 硬件单/双臂由 --dual-arm 决定。"""
+
+    def __init__(self, a, board_z, min_z):
+        self.task = a.task
+        self.servo_hz = a.servo_hz
+        self.speed_profile = a.speed_profile
+        self.speed_scale = a.speed_scale
+        self.chunk_execute = a.chunk
+        self.ensemble_m = a.ensemble_m
+        self.env_mask = float(a.env_mask)
+        self.min_z = min_z
+        self.max_step_m = a.max_step_mm / 1000.0
+        self.dry_run = a.dry_run
+        self.show = not a.no_display
+        self.start_from_lead = a.start_from_lead
+        self.log_joints = a.log_joints
+        self._jguards = {}
+        self.lead_ports = (a.lead_port0, a.lead_port1)
+        self.board_z = board_z; self.press = a.press; self.z_offset = a.start_z_offset
+        self._stop = False
+        self._vis = None
+        # 会话记录(session.json + episodes.jsonl + epNNN/{head/, infer/, log.npz}), 见顶部说明
+        self.head_hz = float(a.head_hz)
+        self.session_dir = None
+        if not a.no_record:
+            slug = re.sub(r"[^A-Za-z0-9]+", "_", a.task).strip("_")[:32]
+            self.session_dir = (pathlib.Path(a.record).expanduser() if a.record
+                                else _ROOT / "data" / "runs" / f"{time.strftime('%Y%m%d-%H%M%S')}_{slug}")
+            self.session_dir.mkdir(parents=True, exist_ok=True)
+            meta = {k: v for k, v in vars(a).items() if isinstance(v, (str, int, float, bool, type(None)))}
+            meta.update(started_unix=time.time(), started=time.strftime("%Y-%m-%d %H:%M:%S"), board_z=board_z, min_z=min_z)
+            (self.session_dir / "session.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+            print(f">>> 本次会话记录到 {self.session_dir}", flush=True)
+        self._infer_dir = None
+        self._rec = []
+        self._cam_lock = threading.Lock()     # wait_for_frames 不能两个线程同时对一条 pipeline 调
+        self.console = _Console()             # stdin 唯一读者: 推理中 q=急停, 局间问成败/是否继续
+
+        print(f">>> [1/4] 加载模型 ({a.config_name})...", flush=True)
+        self.cfg = _config.get_config(a.config_name)
+        # 防呆: checkpoint 路径是 checkpoints/<config>/<exp>/<step>, 目录名≠--config-name
+        # 多半是拿错了配置(权重结构对不上会在下面报 PyTree 错, 提示不直观)。
+        _parts = pathlib.Path(a.checkpoint).resolve().parts
+        if len(_parts) >= 3 and _parts[-3] != a.config_name:
+            print(f">>> ⚠ checkpoint 路径里的配置名是 '{_parts[-3]}', 但 --config-name 给的是 "
+                  f"'{a.config_name}' —— 若接下来报 PyTree 结构不匹配, 改用前者", flush=True)
+        self.policy = _policy_config.create_trained_policy(
+            self.cfg, pathlib.Path(a.checkpoint), default_prompt=self.task)
+        # 模型维度: 20D 双臂模型(data.dual=True) or 10D 单臂模型
+        self.model_dual = bool(getattr(self.cfg.data, "dual", False))
+        if a.dual_arm and not self.model_dual:
+            sys.exit(f"--dual-arm 需要 20D 双臂模型, 但 {a.config_name} 是单臂 10D 配置")
+        print(f">>> [2/4] 模型加载完成 (模型={'20D双臂' if self.model_dual else '10D单臂'}, "
+              f"驱动={'双臂' if a.dual_arm else '仅臂0'})", flush=True)
+
+        # mask prompt 模型(mask_wprime 分支): 头部相机逐帧 mask, 检测器与训练 mask 同源(hqi 的 HF 脚本)
+        self.masker, self._mask_cover = None, None
+        if getattr(self.cfg.model, "use_mask_prompts", False) or getattr(self.cfg.model, "use_controlvla", False):
+            if a.mask_backend != "hf":
+                sys.exit(f"{a.config_name} 需要实时 mask(mask prompt / ControlVLA), 加 --mask-backend hf(与训练 mask 同一套检测器)")
+            names = tuple(getattr(self.cfg.data, "mask_object_names", ()))
+            prompts = dict(MASK_PROMPTS)
+            for kv in a.mask_class:
+                k, v = kv.split("=", 1); prompts[k.strip()] = v
+            missing = [n for n in names if n not in prompts]
+            if missing:
+                sys.exit(f"槽位 {missing} 没有检测词, 用 --mask-class 名字=词1|词2 指定")
+            from hf_mask import HFMaskPredictor  # noqa: E402  airbot/hf_mask.py
+            inside = {k: v for k, v in MASK_INSIDE.items() if k in names and v in names}
+            multi = [n for n in names if n in MASK_MULTI]
+            box_frac = min([MASK_MAX_BOX_FRAC[n] for n in names if n in MASK_MAX_BOX_FRAC], default=1.0)
+            subtract = {k: [v for v in vs if v in names] for k, vs in MASK_SUBTRACT.items() if k in names}
+            subtract = {k: vs for k, vs in subtract.items() if vs}
+            print(f">>> 加载 mask 生成器(HF grounding-dino-base + SAM-B, 0.28/0.24, 与训练同源), 槽位 {names}"
+                  f"{f', 约束 {inside} 外扩 {MASK_INSIDE_MARGIN}' if inside else ''}"
+                  f"{f', 多实例 {multi}(≤3)' if multi else ''}{f', 大框过滤 {box_frac}' if box_frac < 1 else ''}"
+                  f"{f', 扣除 {subtract}' if subtract else ''}", flush=True)
+            self.masker = HFMaskPredictor({n: prompts[n].split("|") for n in names}, inside=inside,
+                                          inside_margin=MASK_INSIDE_MARGIN if inside else 0.0,
+                                          multi=multi, max_instances=3, max_box_frac=box_frac, subtract=subtract)
+        elif a.mask_backend == "hf":
+            print(">>> ⚠ --mask-backend hf 被忽略: 当前 config 没开 use_mask_prompts", flush=True)
+
+        # 夹爪几何 token: 统一从 grippers.npz 按爪名取(与训练同源)。
+        # 全局模式 -> (P,3) 1 token; 区域化模型(region_tokens) -> (3,P,3) tip/mid/rear 各 P 点。
+        # 部署一律喂未增强的规范点云(与训练时 obs 直喂分支一致)。
+        cloud0 = cloud1 = None
+        # 去几何标定(arm_frame)模型: 位姿锚在机械臂报点, 点云须用 ARP 系那份。
+        # --grippers-npz 未显式指定时一律跟随 config, 避免喂错坐标系的点云。
+        self.arm_frame = bool(getattr(self.cfg.data, "arm_frame", False))
+        if a.grippers_npz is None:
+            npz_cfg = getattr(self.cfg.data, "grippers_npz_path", None)
+            a.grippers_npz = str(_ROOT / (npz_cfg or "gripper_geom/grippers.npz"))
+        if self.arm_frame:
+            print(f">>> arm_frame 模型: 位姿=机械臂报点(不补指尖偏移); 点云={a.grippers_npz}",
+                  flush=True)
+        if getattr(self.cfg.model, "gripper_token", False):
+            z = np.load(a.grippers_npz, allow_pickle=True)
+            P = int(getattr(self.cfg.model, "num_gripper_points", 512))
+            region = bool(getattr(self.cfg.model, "region_tokens", False))
+            rng = np.random.default_rng(0)
+
+            def _pick(name):
+                pc = np.asarray(z[f"{name}_points"], np.float32)
+                if region:
+                    reg = np.asarray(z[f"{name}_region"])
+                    return np.stack([
+                        pc[rng.choice(np.flatnonzero(reg == r), P,
+                                      replace=int((reg == r).sum()) < P)]
+                        for r in range(3)])                       # (3, P, 3)
+                idx = rng.choice(len(pc), P, replace=len(pc) < P)
+                return pc[idx]
+            # token-swap 诊断: --arm0/1-cloud 只换喂模型的点云, TCP/开合标定仍按实际装的爪
+            name0 = a.arm0_cloud or a.arm0_gripper
+            name1 = a.arm1_cloud or a.arm1_gripper
+            cloud0 = _pick(name0)
+            cloud1 = _pick(name1) if self.model_dual else None
+            swap0 = f" ⚠SWAP(实装{a.arm0_gripper})" if name0 != a.arm0_gripper else ""
+            swap1 = f" ⚠SWAP(实装{a.arm1_gripper})" if name1 != a.arm1_gripper else ""
+            print(f">>> 夹爪 token{'(区域化 3tok/爪)' if region else ''}: "
+                  f"臂0={name0}{cloud0.shape}{swap0}"
+                  + (f" 臂1={name1}{cloud1.shape}{swap1}" if cloud1 is not None else ""), flush=True)
+        else:
+            print(">>> ⚠ 当前 config 未开 gripper_token, 不注入点云", flush=True)
+
+        # 臂(play_sdk) + 相机(collect_data.DualCamera, color-only)
+        if a.dual_arm:
+            print(">>> [3/4] 连接双臂 + 3 相机...", flush=True)
+            self.robot = PlayRealRobot(left_port=a.port1, right_port=a.port, enable_cameras=False)
+            arm0_handle, arm1_handle = self.robot.right, self.robot.left
+            wrist1_serial = a.arm1_wrist_serial
+        else:
+            print(">>> [3/4] 连接单臂(臂0) + 2 相机...", flush=True)
+            self.robot = PlayRealRobot(port=a.port, enable_cameras=False)
+            arm0_handle, arm1_handle = self.robot.left, None   # play_sdk 单臂句柄挂在 .left
+            wrist1_serial = None                               # 不启动 -> 取帧自动黑图
+        self.cams = DualCamera(head_serial=a.head_serial,
+                               wrist_serial=a.arm0_wrist_serial,
+                               wrist1_serial=wrist1_serial)
+        print(">>> [4/4] 连接完成", flush=True)
+
+        self.arm0 = _ArmCtx(arm0_handle, a.arm0_gripper, cloud0, self.arm_frame)
+        self.arm1 = (_ArmCtx(arm1_handle, a.arm1_gripper, cloud1, self.arm_frame)
+                     if arm1_handle else None)
+        self.pc1 = cloud1   # 20D 模型只驱动臂0时也照喂(被 arm1_mask=0 屏蔽)
+
+        if self.show:
+            cv2.namedWindow("EEF Inference [q/Esc=stop]", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("EEF Inference [q/Esc=stop]", 1200 if a.dual_arm else 960, 300)
+
+    def _arms(self):
+        return (self.arm0,) if self.arm1 is None else (self.arm0, self.arm1)
+
+    # ---- 开局对齐: follow 移到各自 lead 的当前关节角(同采集, 关节分支=示教) ----
+    def _align_to_lead(self):
+        print(">>> --start-from-lead: follow 对齐到 lead 的关节角(会移动!)", flush=True)
+        from airbot_py.arm import AIRBOTArm  # noqa: PLC0415  与 collect_data 同款直连
+        for ctx, port in zip(self._arms(), self.lead_ports):
+            lead = AIRBOTArm(url="localhost", port=port)
+            if not lead.connect():
+                print(f">>> ⚠ [{ctx.name}] 连不上 lead(:{port}), 跳过该臂对齐", flush=True)
+                continue
+            lj = lead.get_joint_pos()
+            lead.disconnect()
+            if lj is None:
+                print(f">>> ⚠ [{ctx.name}] lead(:{port}) 读不到关节角, 跳过", flush=True)
+                continue
+            print(f">>> [{ctx.name}] 对齐到 lead(:{port}): {[f'{v:.3f}' for v in lj]}", flush=True)
+            ctx.h.set_joint_positions(list(lj), blocking=True)   # PLANNING 模式阻塞到位
+        time.sleep(0.3)
+
+    # ---- 观测: 按模型维度组装(20D 缺臂1时按训练的单臂编码: REST10 + mask0 + 黑图) ----
+    def get_observation(self):
+        with self._cam_lock:
+            head_bgr, w0_bgr, w1_bgr = self.cams.get_frames_dual()
+        # 状态紧跟取图读, 要在 DINO+SAM 之前: 否则 mask 分支的状态比图像新约 0.25s, 与 baseline/训练的图像-状态同步不一致
+        st0 = self.arm0.state_wprime()
+        st1 = (self.arm1.state_wprime() if self.arm1 is not None else REST10) if self.model_dual else None
+        masks = None
+        if self.masker is not None:
+            masks = self.masker(head_bgr[:, :, ::-1].copy())
+            self._mask_cover = masks.reshape(len(masks), -1).mean(1) * 100
+            vis_head = head_bgr.copy()
+            for m, c in zip(masks, ((0, 255, 0), (255, 0, 255))):
+                vis_head[m > 0] = (0.45 * vis_head[m > 0] + 0.55 * np.asarray(c)).astype(np.uint8)
+            head_bgr_vis = vis_head
+        else:
+            head_bgr_vis = head_bgr
+        self._vis = (head_bgr_vis, w0_bgr, w1_bgr) if self.model_dual else (head_bgr_vis, w0_bgr)
+        obs = {
+            "observation/image": head_bgr[:, :, ::-1].copy().astype(np.uint8),
+            "observation/wrist_image": w0_bgr[:, :, ::-1].copy().astype(np.uint8),
+            "observation/env_mask": np.float32(self.env_mask),
+            "prompt": self.task,
+        }
+        if self.model_dual:
+            obs["observation/state"] = np.concatenate([st0, st1]).astype(np.float32)
+            obs["observation/wrist_image_1"] = w1_bgr[:, :, ::-1].copy().astype(np.uint8)
+            obs["observation/arm1_mask"] = np.float32(1.0 if self.arm1 is not None else 0.0)
+            if self.arm0.pc is not None:
+                obs["observation/gripper_pc"] = self.arm0.pc
+                obs["observation/gripper_pc_1"] = self.pc1
+        else:
+            obs["observation/state"] = st0
+            if self.arm0.pc is not None:
+                obs["observation/gripper_pc"] = self.arm0.pc
+        if masks is not None:
+            obs["observation/base_region_mask"] = masks
+        return obs
+
+    # ---- 显示 / 急停 ----
+    def _poll_stop(self):
+        if self.console.stop_requested():
+            self._stop = True
+        if not self.show or self._vis is None:
+            return
+        labels = ("ENV [q=STOP]", "ARM0 WRIST(R)", "ARM1 WRIST(L)")
+        imgs = [cv2.resize(v, (400, 300)) for v in self._vis]
+        for im, lab in zip(imgs, labels):
+            cv2.putText(im, lab, (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.imshow("EEF Inference [q/Esc=stop]", np.hstack(imgs))
+        if (cv2.waitKey(1) & 0xFF) in (ord('q'), 27):
+            self._stop = True
+
+    # ---- temporal ensembling: 对整条动作向量(10D/20D)加权平均, 再拆臂 ----
+    def _ensemble(self, chunks, macro):
+        preds, weights = [], []
+        n = len(chunks)
+        for idx, (start, cw) in enumerate(chunks):
+            off = macro - start
+            if 0 <= off < len(cw):
+                preds.append(cw[off])
+                weights.append(float(np.exp(-self.ensemble_m * ((n - 1) - idx))))
+        if not preds:
+            return None
+        w = np.asarray(weights); w /= w.sum()
+        return (w[:, None] * np.asarray(preds, dtype=np.float32)).sum(0).astype(np.float32)
+
+    def _clamp_step(self, arm, cmd_pos):
+        d = cmd_pos - arm.last_p
+        nd = float(np.linalg.norm(d))
+        if nd > self.max_step_m:
+            cmd_pos = arm.last_p + d / nd * self.max_step_m
+        return cmd_pos
+
+    def _servo_macro(self, tgt0, tgt1, macro_dt):
+        """在场的臂同时从各自 last 插值到目标, servo_hz 高频下发。tgt=(pos,quat,g); tgt1=None 只动臂0。"""
+        dt = 1.0 / self.servo_hz
+        nsub = max(1, int(self.servo_hz * macro_dt))
+        moves = [(self.arm0, self.arm0.last_p, self.arm0.last_q, *tgt0)]
+        if tgt1 is not None:
+            moves.append((self.arm1, self.arm1.last_p, self.arm1.last_q, *tgt1))
+        for s in range(nsub):
+            t0 = time.monotonic(); a = (s + 1) / nsub
+            for arm, lp, lq, pt, qt, g in moves:
+                p = (1 - a) * lp + a * pt
+                q = nlerp(lq, qt, a)
+                if p[2] >= self.min_z:                       # 指尖位姿; 下发前转回 EE 点
+                    ee = arm._tip_to_ee(p, q)
+                    arm.h.servo_cart_pose(ee.tolist(), q.tolist())
+                arm.h._robot.servo_eef_pos([arm.g_close + g * (arm.g_open - arm.g_close)])
+            self._poll_stop()
+            if self._stop:
+                return
+            time.sleep(max(0.0, dt - (time.monotonic() - t0)))
+
+    # ---- 主循环 ----
+    # ---- 主循环: 一个进程连续跑多局(模型/相机/臂只装一次), 每局: 对齐 -> 推理 -> 人工判定 -> 落盘 ----
+    def run(self, num_steps=None, timeout=None):
+        print(">>> 进入 run()", flush=True)
+        results = []
+        try:
+            ep = 0
+            while True:
+                rec = self._run_episode(ep, num_steps, timeout)
+                rec = self._end_episode(rec)
+                results.append(rec)
+                while True:      # 下一局必须明确输入 y 才开始(臂会动); 回车/别的键只会重问
+                    ans = self.console.ask(f"\n>>> 复位好场景、摆好 lead 之后, 输入 y 开始第 {ep + 1} 局 | "
+                                           "h=先回零点 | n=结束会话: ", default="n").lower()
+                    if ans in ("y", "n"):
+                        break
+                    if ans == "h":
+                        if not self.dry_run:
+                            self._go_home()
+                    else:
+                        print(">>> 请输入 y / h / n(回车不会开始)", flush=True)
+                if ans == "n":
+                    break
+                ep += 1
+        except KeyboardInterrupt:
+            print("\n>>> Ctrl+C: 结束本次会话", flush=True)
+        finally:
+            self._print_summary(results)
+            self.shutdown()
+
+    def _run_episode(self, ep, num_steps, timeout):
+        """跑一局直到 q / --steps / --timeout。计时从第一条运动指令起算(对齐 lead、建 W'、JIT 热身不算)。"""
+        self._stop = False
+        self._rec, self._jguards = [], {}
+        ep_dir = self.session_dir / f"ep{ep:03d}" if self.session_dir is not None else None
+        self._infer_dir = None
+        if ep_dir is not None:
+            self._infer_dir = ep_dir / "infer"
+            self._infer_dir.mkdir(parents=True, exist_ok=True)
+        rec = {"episode": ep, "task": self.task, "t_episode_start_unix": round(time.time(), 3),
+               "t_motion_start_unix": None, "t_end_unix": None, "motion_time_s": None,
+               "stop_reason": None, "n_infer": 0, "dir": str(ep_dir) if ep_dir else None}
+        print(f"\n>>> ========== 第 {ep} 局 ==========", flush=True)
+        if self.start_from_lead and not self.dry_run:
+            self._align_to_lead()
+        else:
+            print(">>> 在当前位姿建立 W'(不自动移动; 请先把臂摆到与训练开局相似的姿态)", flush=True)
+        # W': 臂0 带 board_z/press/z_offset 配准(接触任务); 臂1 用原始位姿。每局重建(开局位姿可能不同)
+        self.arm0.establish_wprime(self.board_z, self.press, self.z_offset)
+        if self.arm1 is not None:
+            self.arm1.establish_wprime()
+
+        if not self.dry_run:
+            self.robot.set_speed_profile(self.speed_profile)   # 对在场的臂都设速度档
+            for arm in self._arms():
+                arm.h.switch_mode(RobotMode.SERVO_CART_POSE)
+            time.sleep(0.2)
+            for arm in self._arms():        # 播种保持点
+                p, q = arm.h.get_end_pose()
+                arm.h.servo_cart_pose(list(p), list(q))
+            time.sleep(0.3)
+        for arm in self._arms():
+            arm.seed_last(self.dry_run)
+
+        recorder = None
+        t_motion0 = None          # 第一条运动指令(monotonic); None = 一拍都没执行
+        t_start = time.monotonic()
+        macro = 0                 # 绝对 macro 时刻(=训练 10Hz 的一拍)
+        chunks = []               # [(start_macro, chunk (H, 10/20))] 用于时序集成
+        macro_dt = (1.0 / 10.0) / self.speed_scale
+        first = True
+        print(f">>> 进入推理循环(dry-run={self.dry_run}, ensemble_m={self.ensemble_m}, "
+              f"重推间隔={self.chunk_execute}, speed_scale={self.speed_scale}); q=结束本局", flush=True)
+        try:
+            while not self._stop:
+                if num_steps and macro >= num_steps:
+                    rec["stop_reason"] = "steps"; break
+                if timeout and time.monotonic() - t_start > timeout:
+                    rec["stop_reason"] = "timeout"; break
+
+                if macro % self.chunk_execute == 0:
+                    obs = self.get_observation()
+                    if first:
+                        print(">>> 首次推理 JIT 编译中, 可能 1-2 分钟...", flush=True)
+                        first = False
+                    ti = time.monotonic()
+                    cw = np.asarray(self.policy.infer(obs)["actions"], dtype=np.float32)
+                    chunks.append((macro, cw))
+                    rec["n_infer"] += 1
+                    if self._infer_dir is not None:
+                        for im, name in zip(self._vis, ("head", "wrist0", "wrist1")):
+                            cv2.imwrite(str(self._infer_dir / f"{macro:05d}_{name}.jpg"), im)
+                        self._rec.append((macro, time.monotonic() - t_start, np.asarray(obs["observation/state"]).copy(), cw.copy()))
+                    keep = max(2, -(-cw.shape[0] // self.chunk_execute))
+                    chunks = chunks[-keep:]
+                    st = obs["observation/state"]
+                    _mc = (f"mask 槽 {self._mask_cover.round(1).tolist()}% " if self._mask_cover is not None else "")
+                    msg = (f">>> [macro {macro}] {_mc}推理 {(time.monotonic()-ti)*1000:.0f}ms  "
+                           f"臂0 pos={st[:3].round(3).tolist()} grip={st[9]:.2f} "
+                           f"爪chunk[{cw[0,9]:.2f}→{cw[-1,9]:.2f}]")   # 首→末: 全程持平=不动点, 末端抬升=打算张开
+                    if self.model_dual and self.arm1 is not None:
+                        msg += f" | 臂1 pos={st[10:13].round(3).tolist()} grip={st[19]:.2f}"
+                    print(msg + f"  (集成 {len(chunks)})", flush=True)
+
+                a_w = self._ensemble(chunks, macro)
+                if a_w is None:
+                    rec["stop_reason"] = "no_action"; break
+                p0, q0, g0 = self.arm0.action_to_base(a_w[:10])
+                # 诊断: 指令层面的【跳变】= 相邻两拍位移量突变(加速度尖峰), 不是速度快。
+                # 搬运段 15-20mm/拍 是正常速度, 不报; 一拍位移比上一拍突然多/少 >12mm 才报。
+                _d = float(np.linalg.norm(p0 - self.arm0.last_p)) if self.arm0.last_p is not None else 0.0
+                _prev_d = getattr(self, "_prev_d0", _d)
+                _gjump = abs(g0 - self._last_g0) if hasattr(self, "_last_g0") else 0.0
+                if abs(_d - _prev_d) > 0.012 or _gjump > 0.2 or _d > self.max_step_m:
+                    print(f"    ⚡ [macro {macro}] 指令跳变: 本拍位移 {_d*1000:.0f}mm (上拍 {_prev_d*1000:.0f}mm)"
+                          f"{' -> 夹到30mm' if _d > self.max_step_m else ''}  夹爪 Δ{_gjump:.2f}", flush=True)
+                self._prev_d0 = _d; self._last_g0 = g0
+                if self.log_joints:   # 关节守卫: 每拍查关节余量, 逼近限位即报; 每个 chunk 打印一次臂0关节角
+                    for _k, _arm in enumerate(self._arms()):
+                        try:
+                            _q = _arm.h._robot.get_joint_pos()
+                        except Exception:
+                            _q = None
+                        if not _q:
+                            continue
+                        _g = self._jguards.setdefault(
+                            _k, JointGuard(f"臂{_k}", rate_hz=10, log=lambda m: print(m, flush=True)))
+                        _g.update(_q)
+                        if _k == 0 and macro % self.chunk_execute == 0:
+                            print("    关节(deg): " + " ".join(f"J{i+1}={np.degrees(v):+.0f}" for i, v in enumerate(_q)), flush=True)
+                p0 = self._clamp_step(self.arm0, p0)
+                tgt1 = None
+                if self.arm1 is not None:
+                    p1, q1, g1 = self.arm1.action_to_base(a_w[10:20])
+                    tgt1 = (self._clamp_step(self.arm1, p1), q1, g1)
+
+                if t_motion0 is None:         # 计时起点 = 第一条运动指令(dry-run 时 = 第一次推理落地)
+                    t_motion0 = time.monotonic()
+                    rec["t_motion_start_unix"] = round(time.time(), 3)
+                    if ep_dir is not None and self.head_hz > 0:
+                        recorder = _HeadRecorder(self.cams, self._cam_lock, ep_dir / "head", self.head_hz)
+                        recorder.start(t_motion0)
+                    print(f">>> ⏱ 计时开始(第一条运动指令); 头部相机 {self.head_hz:g}Hz 留档" if recorder
+                          else ">>> ⏱ 计时开始(第一条运动指令)", flush=True)
+                if self.dry_run:
+                    if macro % self.chunk_execute == 0:
+                        msg = f"    -> 臂0 base pos={np.round(p0,3).tolist()} g={g0:.2f}"
+                        if tgt1 is not None:
+                            msg += f" | 臂1 base pos={np.round(tgt1[0],3).tolist()} g={tgt1[2]:.2f}"
+                        print(msg, flush=True)
+                    self._poll_stop()
+                    time.sleep(0.05)
+                else:
+                    self._servo_macro((p0, q0, g0), tgt1, macro_dt)
+                    self.arm0.last_p, self.arm0.last_q = p0, q0
+                    if tgt1 is not None:
+                        self.arm1.last_p, self.arm1.last_q = tgt1[0], tgt1[1]
+                macro += 1
+            if self._stop and rec["stop_reason"] is None:
+                rec["stop_reason"] = "q"
+        except KeyboardInterrupt:
+            rec["stop_reason"] = "ctrl-c"
+        finally:
+            t_end = time.monotonic()
+            rec["t_end_unix"] = round(time.time(), 3)
+            if t_motion0 is not None:
+                rec["motion_time_s"] = round(t_end - t_motion0, 2)
+            rec["macro_steps"] = macro
+            if recorder is not None:
+                rec["head_frames"] = recorder.stop()
+            for _g in self._jguards.values():
+                print(">>> " + _g.summary(), flush=True)
+            if ep_dir is not None and self._rec:
+                m, t, st, cw = zip(*self._rec)
+                np.savez(ep_dir / "log.npz", macro=np.array(m), t=np.array(t), state=np.stack(st), actions=np.stack(cw))
+            if not self.dry_run:
+                # 停在原地: 切 PLANNING 保持当前位姿, 夹爪张到最大(松开持物)
+                for arm in self._arms():
+                    try:
+                        arm.h._robot.switch_mode(RobotMode.PLANNING_POS)
+                    except Exception:
+                        pass
+                    try:
+                        arm.h._robot.move_eef_pos(1.0)
+                    except Exception:
+                        pass
+                print(">>> 已停在原地并张开夹爪。", flush=True)
+        mt = rec["motion_time_s"]
+        print(f">>> 本局结束({rec['stop_reason']}): 用时 {'没动' if mt is None else f'{mt:.1f}s'}, "
+              f"推理 {rec['n_infer']} 次" + (f", 头部留档 {rec.get('head_frames', 0)} 帧" if recorder else ""), flush=True)
+        return rec
+
+    def _end_episode(self, rec):
+        """人工判定(先问人, y/n 必答; x=作废不计入), 进度和备注可空; 追加到 episodes.jsonl。"""
+        while True:
+            v = self.console.ask(">>> 人工判定本局: 成功 y / 失败 n / 作废 x(不计入): ", default="x").lower()
+            if v in ("y", "n", "x"):
+                break
+            print(">>> 请输入 y / n / x", flush=True)
+        rec["human_success"] = {"y": True, "n": False}.get(v)
+        rec["counted"] = v != "x"
+        prog = self.console.ask(">>> 本局任务进度 0-100(回车=不填): ", default="").rstrip("%")
+        try:
+            rec["progress_pct"] = float(prog) if prog and 0.0 <= float(prog) <= 100.0 else None
+        except ValueError:
+            rec["progress_pct"] = None
+        note = self.console.ask(">>> 备注(回车=无): ", default="")
+        if note:
+            rec["note"] = note
+        if self.session_dir is not None:
+            with open(self.session_dir / "episodes.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        print(f">>> 第 {rec['episode']} 局: human_success={rec['human_success']} motion_time_s={rec['motion_time_s']} "
+              f"progress={rec['progress_pct']} counted={rec['counted']}"
+              + (f" -> {self.session_dir / 'episodes.jsonl'}" if self.session_dir else ""), flush=True)
+        return rec
+
+    def _print_summary(self, results):
+        counted = [r for r in results if r.get("counted")]
+        if not results:
+            return
+        ok = sum(1 for r in counted if r.get("human_success"))
+        times = [r["motion_time_s"] for r in counted if r.get("motion_time_s") is not None]
+        sr = f"{ok}/{len(counted)} = {100.0 * ok / len(counted):.0f}%" if counted else "无计入局"
+        print(f"\n>>> 会话小结: 共 {len(results)} 局, 计入 {len(counted)} 局, 成功率 {sr}"
+              + (f", 计入局平均用时 {np.mean(times):.1f}s (中位 {np.median(times):.1f}s)" if times else "")
+              + (f"\n>>> 记录: {self.session_dir}" if self.session_dir else ""), flush=True)
+
+    def _go_home(self):
+        for arm in self._arms():
+            try:
+                arm.h._robot.switch_mode(RobotMode.PLANNING_POS)
+                arm.h.set_joint_positions(list(ZERO_JOINT), blocking=True)
+                print(f">>> [{arm.name}] 已回零点", flush=True)
+            except Exception as e:
+                print(f">>> [{arm.name}] 回零失败: {e}", flush=True)
+
+    def shutdown(self):
+        logger.info("关闭...")
+        try:
+            if not self.dry_run:
+                # 可选回零: 回车=回零; n/Ctrl+C/无stdin = 保持原地
+                do_home = False
+                try:
+                    do_home = self.console.ask(">>> 按【回车】自动回零点, 或输入 n 后回车保持原地: ", default="n").lower() == ""
+                except KeyboardInterrupt:
+                    print("\n>>> 跳过自动回零, 保持原地", flush=True)
+                if do_home:
+                    self._go_home()
+                else:
+                    print(">>> 保持原地; 需要时用 test_play.py 手动归零", flush=True)
+            try:
+                self.cams.stop()
+            except Exception:
+                pass
+            self.robot.shutdown()
+        except Exception as e:
+            logger.error(f"关闭失败: {e}")
+        if self.show:
+            cv2.destroyAllWindows()
+
+
+class _Console:
+    """stdin 的唯一读者(后台线程 -> 带时间戳的队列): 推理中 'q'/'stop' 当急停键轮询; 局间 ask() 阻塞问答,
+    只接受提示语显示之后敲的行(之前排队的回车/q 一律丢弃)。stdin 关闭(非交互)时 ask() 直接返回 default。"""
+
+    def __init__(self):
+        self._q = queue.Queue()
+        self.eof = False
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            try:
+                line = sys.stdin.readline()
+            except Exception:
+                line = ""
+            if not line:
+                self.eof = True
+                break
+            self._q.put((time.monotonic(), line.rstrip("\n")))
+
+    def stop_requested(self):
+        hit = False
+        while True:
+            try:
+                _, line = self._q.get_nowait()
+            except queue.Empty:
+                return hit
+            if line.strip().lower() in ("q", "stop"):
+                hit = True
+
+    def ask(self, prompt, default=""):
+        t_prompt = time.monotonic()
+        print(prompt, end="", flush=True)
+        while True:
+            try:
+                ts, line = self._q.get(timeout=0.5)
+            except queue.Empty:
+                if self.eof:
+                    print(f"[stdin 已关闭, 取 '{default}']", flush=True)
+                    return default
+                continue
+            if ts >= t_prompt:
+                return line.strip()
+
+
+class _HeadRecorder:
+    """局内头部相机定频留档(默认 2Hz, 原图): head/NNNNN_TTTTT.Ts.jpg(序号_距计时起点秒数) + frames.csv。
+    与推理线程共用相机锁(wait_for_frames 不能两个线程同时对一条 pipeline 调)。"""
+
+    def __init__(self, cams, lock, out_dir, hz):
+        self.cams, self.lock, self.hz = cams, lock, float(hz)
+        self.dir = pathlib.Path(out_dir)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.t0 = None
+        self.n = 0
+        self._stop = threading.Event()
+        self._th = None
+        self._csv = open(self.dir / "frames.csv", "w", encoding="utf-8")
+        self._csv.write("index,unix_time,t_rel_s\n")
+
+    def start(self, t0):
+        self.t0 = t0
+        self._th = threading.Thread(target=self._loop, daemon=True)
+        self._th.start()
+
+    def _loop(self):
+        period = 1.0 / self.hz
+        pipe = self.cams.pipelines.get("head")
+        while not self._stop.is_set():
+            tick = time.monotonic()
+            with self.lock:
+                bgr = self.cams._grab("head", pipe) if pipe is not None else None
+            rel = time.monotonic() - self.t0
+            if bgr is not None:
+                cv2.imwrite(str(self.dir / f"{self.n:05d}_{rel:07.1f}s.jpg"), bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                self._csv.write(f"{self.n},{time.time():.3f},{rel:.2f}\n")
+                self.n += 1
+            self._stop.wait(max(0.0, period - (time.monotonic() - tick)))
+
+    def stop(self):
+        self._stop.set()
+        if self._th is not None:
+            self._th.join(timeout=3.0)
+        self._csv.close()
+        return self.n
+
+
+def main():
+    ap = argparse.ArgumentParser(description="AirBot Play EEF(任务空间) 推理 — 单/双臂统一")
+    # 模型
+    ap.add_argument("--checkpoint", required=True)
+    ap.add_argument("--config-name", required=True,
+                    help="训练配置名(决定模型维度): 10D=pi05_cotrain_eef_grip_aug 等; "
+                         "20D=pi05_cotrain_dualarm")
+    ap.add_argument("--task", required=True, help="prompt, 必须与训练 tasks.jsonl 逐字一致")
+    # 硬件
+    ap.add_argument("--dual-arm", action="store_true",
+                    help="驱动两条臂(需 20D 模型)。不加=只驱动臂0(右); 20D 模型时臂1自动按 rest 编码")
+    ap.add_argument("--port", type=int, default=50050, help="臂0(右)follow 端口")
+    ap.add_argument("--port1", type=int, default=50052, help="臂1(左)follow 端口")
+    ap.add_argument("--start-from-lead", action="store_true",
+                    help="rollout 前 follow 对齐到 lead(遥操作臂)当前关节角(同采集, 防撞限位)。"
+                         "先把 lead 摆到示教开局姿态! 单/双臂都支持")
+    ap.add_argument("--lead-port0", type=int, default=50051, help="臂0 lead 端口(同 collect_data)")
+    ap.add_argument("--lead-port1", type=int, default=50053, help="臂1 lead 端口(同 collect_data)")
+    # 夹爪(与臂号解耦, 装什么写什么)
+    ap.add_argument("--arm0-gripper", default="parallel",
+                    help="臂0(右)实际装的爪 parallel/get; 决定点云 token+开合范围+TCP偏移")
+    ap.add_argument("--arm1-gripper", default="parallel", help="臂1(左)实际装的爪")
+    ap.add_argument("--arm0-cloud", default=None,
+                    help="token-swap 诊断: 只换臂0喂模型的爪点云(运动学标定仍用 --arm0-gripper); "
+                         "如实装 parallel 时传 get。默认=同 --arm0-gripper")
+    ap.add_argument("--arm1-cloud", default=None, help="同上, 覆盖臂1点云")
+    ap.add_argument("--grippers-npz", default=None,   # None=跟随 config 的 grippers_npz_path
+                    help="多爪点云库, 按爪名取(与训练同源)")
+    # 相机
+    ap.add_argument("--head-serial", default="230422271972", help="环境(头)相机 SN")
+    ap.add_argument("--arm0-wrist-serial", default="230422271433", help="臂0(右)手眼相机 SN")
+    ap.add_argument("--arm1-wrist-serial", default="218622271178", help="臂1(左)手眼相机 SN")
+    # 任务相关
+    ap.add_argument("--env-mask", type=float, default=1.0,
+                    help="环境(头)相机有效性: 默认 1; 擦黑板(单相机训练)传 0")
+    ap.add_argument("--board-z", type=float, default=None,
+                    help="[接触任务] 示教测得的板面 base z(m), 自动配准起点高度(臂0)")
+    ap.add_argument("--board-z-auto", action="store_true",
+                    help="[接触任务] 读 gripper_params.py 里臂0爪的 board_z(擦黑板专用)")
+    ap.add_argument("--press", type=float, default=0.005, help="压入板面量(m), 配 board_z")
+    ap.add_argument("--start-z-offset", type=float, default=0.0, help="臂0 W' 原点 z 手动微调(m)")
+    ap.add_argument("--min-z", type=float, default=None,
+                    help="base 系最低 z(m) 防撞桌; 缺省: board_z-0.012, 无 board_z 时 -0.12")
+    # 执行
+    ap.add_argument("--servo-hz", type=float, default=250.0)
+    ap.add_argument("--speed-profile", choices=["slow", "default", "fast"], default="fast")
+    ap.add_argument("--speed-scale", type=float, default=1.0,
+                    help="执行速度倍率; 1.0=按示教原速(勿超过 1.0)")
+    ap.add_argument("--chunk", type=int, default=10,
+                    help="每隔几拍重推理; 10=整段开环执行(离散事件如松爪不被截断, 推荐); "
+                         "动态场景需快速反应时调小(如5)")
+    ap.add_argument("--ensemble-m", type=float, default=0.3,
+                    help="时序集成权重衰减(仅 chunk<horizon 有重叠时生效)")
+    ap.add_argument("--max-step-mm", type=float, default=30.0, help="单拍位移上限(防野跳)")
+    ap.add_argument("--steps", type=int, default=None)
+    ap.add_argument("--timeout", type=float, default=None)
+    ap.add_argument("--dry-run", action="store_true", help="只推理+打印, 不发运动")
+    ap.add_argument("--log-joints", action="store_true",
+                    help="关节守卫: 关节距限位 <15° 提示、<5° 报危险(时刻以 macro/10 秒计); 每个 chunk 打印一次臂0关节角; "
+                         "结束时打印本次最贴限位的关节。用于核对抽动是否发生在逼近关节限位时")
+    ap.add_argument("--no-display", action="store_true")
+    ap.add_argument("--mask-backend", choices=["none", "hf"], default="none",
+                    help="mask prompt 模型(如 pi05_single_parallel_sweep_mask)必须用 hf: 与训练 mask 同一套检测器")
+    ap.add_argument("--mask-class", action="append", default=[], metavar="名字=词1|词2",
+                    help="覆盖某个槽位的检测词; 默认见 MASK_PROMPTS(扫地 blue_dustpan/hand_brush, 擦黑板 eraser/whiteboard), "
+                         "与训练 mask 一致, 一般不用改")
+    # 会话记录(与 openpi_with_mask_realrobot/local_inference_mask.py 同一布局)
+    ap.add_argument("--head-hz", type=float, default=2.0,
+                    help="局内头部相机留档频率(Hz), 0=不留; 文件在 <会话目录>/epNNN/head/, 可用 ffmpeg 拼视频")
+    ap.add_argument("--no-record", action="store_true", help="不落盘(不建会话目录; 仍会问成败并打印小结)")
+    ap.add_argument("--record", default=None, metavar="DIR",
+                    help="会话目录; 缺省 data/runs/<时间>_<任务>/。内含 session.json, episodes.jsonl(每局成败/用时), "
+                         "epNNN/head/(定频头部原图) epNNN/infer/(每次推理的几路图) epNNN/log.npz")
+    args = ap.parse_args()
+
+    # board_z: 显式 > auto(读臂0爪的 gripper_params) > 无
+    board_z = args.board_z
+    if board_z is None and args.board_z_auto:
+        board_z = get_params(args.arm0_gripper).get("board_z")
+        if board_z is None:
+            sys.exit(f"--board-z-auto: gripper_params 里 '{args.arm0_gripper}' 没有 board_z")
+        print(f">>> --board-z-auto: 用 {args.arm0_gripper} 的 board_z={board_z:+.3f}", flush=True)
+    min_z = args.min_z if args.min_z is not None else (
+        board_z - 0.012 if board_z is not None else -0.12)
+
+    runner = EEFRunner(args, board_z=board_z, min_z=min_z)
+    runner.run(num_steps=args.steps, timeout=args.timeout)
+
+
+if __name__ == "__main__":
+    main()
